@@ -205,6 +205,48 @@ Public Class Utils
         Return DriveID
     End Function
 
+    ''' <summary>
+    ''' Device path of a locally attached PS2/PSX HDD for the Windows tools (local-HDD backend only).
+    ''' Returns "WMIC_INSTALL_REQUIRED" when wmic is missing.
+    ''' </summary>
+    Public Shared Function GetLocalHDDDevicePath() As String
+        Dim DriveID As String = ""
+
+        'Query the drives
+        Using WMIC As New Process()
+            WMIC.StartInfo.FileName = "wmic"
+            WMIC.StartInfo.Arguments = "diskdrive get Caption,DeviceID"
+            WMIC.StartInfo.RedirectStandardOutput = True
+            WMIC.StartInfo.UseShellExecute = False
+            WMIC.StartInfo.CreateNoWindow = True
+            Try
+                WMIC.Start()
+            Catch ex As ComponentModel.Win32Exception 'Windows 11 removed wmic, prompt for installation before continuing
+                Return "WMIC_INSTALL_REQUIRED"
+            End Try
+            WMIC.WaitForExit()
+
+            'Read the output
+            Dim OutputReader As StreamReader = WMIC.StandardOutput
+            Dim ProcessOutput As String() = OutputReader.ReadToEnd().Split({vbCrLf}, StringSplitOptions.None)
+
+            'Find the drive
+            For Each Line As String In ProcessOutput
+                If Not String.IsNullOrWhiteSpace(Line) Then
+                    If Line.Contains("Microsoft Virtual Disk") Then 'For testing with local VHD
+                        DriveID = Line.Split(New String() {" "}, StringSplitOptions.RemoveEmptyEntries)(3).Trim()
+                        Exit For
+                    ElseIf Line.Contains("is not recognized") Then 'Windows 11 removed wmic, prompt for installation before continuing
+                        DriveID = "WMIC_INSTALL_REQUIRED"
+                        Exit For
+                    End If
+                End If
+            Next
+        End Using
+
+        Return DriveID
+    End Function
+
     Public Shared Sub ReloadProjects()
         For Each Win In Windows.Application.Current.Windows()
             If Win.ToString = "PSX_XMB_Manager.NewMainWindow" Then

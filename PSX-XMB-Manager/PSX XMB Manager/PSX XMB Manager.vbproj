@@ -170,6 +170,13 @@
     </Compile>
     <Compile Include="Classes\PS2Game.vb" />
     <Compile Include="Classes\Structs.vb" />
+    <Compile Include="Storage\IPSXStorageBackend.vb" />
+    <Compile Include="Storage\LocalWindowsBackend.vb" />
+    <Compile Include="Storage\StorageBackendFactory.vb" />
+    <Compile Include="Storage\StorageBackendKind.vb" />
+    <Compile Include="Storage\StorageModels.vb" />
+    <Compile Include="Storage\WSL2NBDBackend.vb" />
+    <Compile Include="Storage\WSLProcessRunner.vb" />
     <Compile Include="SyncWindow.xaml.vb">
       <DependentUpon>SyncWindow.xaml</DependentUpon>
     </Compile>
@@ -319,6 +326,12 @@
       <CustomToolNamespace>My.Resources</CustomToolNamespace>
     </EmbeddedResource>
     <EmbeddedResource Include="DIC.xshd" />
+    <EmbeddedResource Include="WSL\bootstrap-wsl.sh">
+      <LogicalName>PSX_XMB_Manager.WSL.bootstrap-wsl.sh</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="WSL\psx-xmb-helper.py">
+      <LogicalName>PSX_XMB_Manager.WSL.psx-xmb-helper.py</LogicalName>
+    </EmbeddedResource>
     <None Include="My Project\app.manifest" />
     <None Include="My Project\Settings.settings">
       <Generator>SettingsSingleFileGenerator</Generator>

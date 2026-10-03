@@ -5,6 +5,79 @@
         Private _NBDDriveName As String
         Private _DriveID As String
         Private _ConnectedOnIP As String
+        Private _BackendKind As StorageBackendKind
+        Private _NBDPort As Integer
+        Private _NativeDevicePath As String
+        Private _WindowsAccessibleDevicePath As String
+        Private _WslDistro As String
+        Private _WslMountRoot As String
+        Private _IsReadOnly As Boolean
+
+        Public Property BackendKind As StorageBackendKind
+            Get
+                Return _BackendKind
+            End Get
+            Set
+                _BackendKind = Value
+            End Set
+        End Property
+
+        Public Property NBDPort As Integer
+            Get
+                Return _NBDPort
+            End Get
+            Set
+                _NBDPort = Value
+            End Set
+        End Property
+
+        ''' <summary>The device path the backend's own tools use (Linux raw NBD file for WSL2, \\.\PhysicalDriveN locally).</summary>
+        Public Property NativeDevicePath As String
+            Get
+                Return _NativeDevicePath
+            End Get
+            Set
+                _NativeDevicePath = Value
+            End Set
+        End Property
+
+        Public Property WindowsAccessibleDevicePath As String
+            Get
+                Return _WindowsAccessibleDevicePath
+            End Get
+            Set
+                _WindowsAccessibleDevicePath = Value
+            End Set
+        End Property
+
+        Public Property WslDistro As String
+            Get
+                Return _WslDistro
+            End Get
+            Set
+                _WslDistro = Value
+            End Set
+        End Property
+
+        Public Property WslMountRoot As String
+            Get
+                Return _WslMountRoot
+            End Get
+            Set
+                _WslMountRoot = Value
+            End Set
+        End Property
+
+        Public Property IsReadOnly As Boolean
+            Get
+                Return _IsReadOnly
+            End Get
+            Set
+                _IsReadOnly = Value
+            End Set
+        End Property
+
+        ' Legacy compatibility: for WSL2 NBD, DriveID and HDLDriveName both hold NativeDevicePath.
 
         Public Property DriveID As String
             Get
