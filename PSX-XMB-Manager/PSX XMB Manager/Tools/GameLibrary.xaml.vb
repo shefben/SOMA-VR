@@ -1,14 +1,13 @@
 ﻿Imports System.ComponentModel
 Imports System.IO
+Imports System.Threading
 Imports System.Windows.Forms
-Imports System.Windows.Threading
 Imports PSX_XMB_Manager.Structs
 
 Public Class GameLibrary
 
     Public MountedDrive As MountedPSXDrive
-    Dim WithEvents HDLDump As New Process()
-    Dim WithEvents HDLDump2 As New Process()
+    Public StorageBackend As IPSXStorageBackend
 
     Dim WithEvents GameLoaderWorker As New BackgroundWorker() With {.WorkerReportsProgress = True}
     Dim WithEvents PSXDatacenterBrowser As New WebBrowser() With {.ScriptErrorsSuppressed = True}
@@ -24,10 +23,6 @@ Public Class GameLibrary
     Dim GamePartitions As New List(Of GamePartition)
 
     Public SelectedGameToModify As PS2Game
-    Dim NewDriveLetter As String
-    Dim WithEvents MountDelay As New DispatcherTimer With {.Interval = TimeSpan.FromSeconds(1)}
-
-    Dim ProcessOutputCommand As String = ""
 
     'Selected game context menu (PC)
     Dim WithEvents PCPS2GamesContextMenu As New Controls.ContextMenu()
@@ -45,6 +40,22 @@ Public Class GameLibrary
         'ContextMenu for games on PSX HDD
         PSXPS2GamesContextMenu.Items.Add(ModifyPartitionMenuItem)
         PSXPS2GamesContextMenu.Items.Add(RemoveMenuItem)
+
+        If StorageBackend IsNot Nothing Then AddHandler StorageBackend.MountRemoved, AddressOf StorageBackend_MountRemoved
+    End Sub
+
+    Private Sub GameLibrary_Closed(sender As Object, e As EventArgs) Handles Me.Closed
+        If StorageBackend IsNot Nothing Then RemoveHandler StorageBackend.MountRemoved, AddressOf StorageBackend_MountRemoved
+    End Sub
+
+    Private Shared Sub ShowError(ex As Exception, title As String)
+        Dim backendError As StorageBackendException = TryCast(ex, StorageBackendException)
+        MsgBox(If(backendError IsNot Nothing, BackendErrorCodes.FormatForUser(backendError), ex.Message), MsgBoxStyle.Critical, title)
+    End Sub
+
+    Private Shared Sub ShowToolFailure(tool As String, result As ProcessResult, title As String)
+        Dim reason As String = If(result.TimedOut, " timed out.", If(result.Cancelled, " was cancelled.", " failed with exit code " + result.ExitCode.ToString() + "."))
+        MsgBox(tool + reason + vbCrLf + vbCrLf + result.CombinedOutput.Trim().Replace(vbLf, vbCrLf), MsgBoxStyle.Exclamation, title)
     End Sub
 
 #Region "Game Loader"
@@ -356,32 +367,109 @@ Public Class GameLibrary
         End If
     End Sub
 
-    Private Sub LoadGamePartitions()
-        'HDL TOC of the PSX HDD
-        HDLDump = New Process()
-        HDLDump.StartInfo.FileName = My.Computer.FileSystem.CurrentDirectory + "\Tools\hdl_dump.exe"
-        HDLDump.StartInfo.Arguments = "hdl_toc " + MountedDrive.HDLDriveName
-        HDLDump.StartInfo.RedirectStandardOutput = True
-        AddHandler HDLDump.OutputDataReceived, AddressOf OutputDataHandler
-        HDLDump.StartInfo.UseShellExecute = False
-        HDLDump.StartInfo.CreateNoWindow = True
-        HDLDump.Start()
-        HDLDump.BeginOutputReadLine()
-    End Sub
+    ''' <summary>Lists the games of the PSX HDD ("hdl_dump hdl_toc") and then loads their infos and covers.</summary>
+    Private Async Function LoadGamePartitionsAsync() As Task
+        Dim Result As ProcessResult = Nothing
+        Try
+            Result = Await StorageBackend.RunHdlDumpAsync({"hdl_toc", StorageBackend.MountedDrive.HDLDriveName}, Nothing, CancellationToken.None)
+        Catch ex As Exception
+            NewLoadingWindow.Close()
+            ShowError(ex, "Could not read the games list")
+            Return
+        End Try
 
-    Private Sub LoadPartitions()
-        'TOC of the PSX HDD
-        HDLDump2 = New Process()
-        HDLDump2.StartInfo.FileName = My.Computer.FileSystem.CurrentDirectory + "\Tools\hdl_dump.exe"
-        HDLDump2.StartInfo.Arguments = "toc " + MountedDrive.HDLDriveName
-        HDLDump2.StartInfo.RedirectStandardOutput = True
-        AddHandler HDLDump2.OutputDataReceived, AddressOf FullOutputDataHandler
-        HDLDump2.StartInfo.UseShellExecute = False
-        HDLDump2.StartInfo.CreateNoWindow = True
-        HDLDump2.EnableRaisingEvents = True
-        HDLDump2.Start()
-        HDLDump2.BeginOutputReadLine()
-    End Sub
+        If Not Result.Succeeded Then
+            NewLoadingWindow.Close()
+            ShowToolFailure("hdl_dump hdl_toc", Result, "Could not read the games list")
+            Return
+        End If
+
+        Dim FoundGames As New List(Of PS2Game)
+        Dim GamesWithoutInfos As New HashSet(Of PS2Game)
+        Dim AvailableSpaceInGB As Double = -1
+
+        'Checking which game infos exist goes over the network, so it stays off the UI thread
+        Await Task.Run(Sub()
+                           For Each Line As String In OutputText.SplitLines(Result.StandardOutput)
+                               If Line.StartsWith("DVD") Or Line.StartsWith("CD") Then 'Game found
+                                   Dim GamePart As GamePartition = PartitionManager.ParseGamePartition(Line)
+                                   Dim GameID As String = GamePart.Startup.Replace("_", "-").Replace(".", "")
+                                   Dim NewPS2Game As New PS2Game() With {.GameSize = GamePart.Size, .GameID = GameID}
+
+                                   GamePartitions.Add(GamePart)
+
+                                   If Utils.IsURLValid("https://psxdatacenter.com/psx2/games2/" + GameID + ".html") Then
+                                       URLs.Add("https://psxdatacenter.com/psx2/games2/" + GameID + ".html")
+                                   Else
+                                       NewPS2Game.GameTitle = GetPS2GameTitleFromDatabaseList(GameID)
+                                       GamesWithoutInfos.Add(NewPS2Game)
+                                   End If
+
+                                   FoundGames.Add(NewPS2Game)
+
+                               ElseIf Line.StartsWith("total") Then 'Last line of hdl_dump hdl_toc
+                                   Dim HDDSizes As String() = Line.Split({","}, StringSplitOptions.RemoveEmptyEntries)
+                                   If HDDSizes.Length > 2 Then AvailableSpaceInGB = Utils.GetIntOnly(HDDSizes(2)) / 1024
+                               End If
+                           Next
+                       End Sub)
+
+        For Each FoundGame As PS2Game In FoundGames
+            If GamesWithoutInfos.Contains(FoundGame) Then
+                FoundGame.GameCoverSource = New BitmapImage(New Uri("/Images/blankcover.png", UriKind.RelativeOrAbsolute))
+            End If
+            GamesListView.Items.Add(FoundGame)
+        Next
+        GamePartitionsCount = FoundGames.Count
+
+        If AvailableSpaceInGB >= 0 Then
+            CurrentDirectoryTextBlock.Text = "PSX HDD" + " - Available: " + FormatNumber(AvailableSpaceInGB, 2) + " GB"
+
+            'Left space indicator
+            If AvailableSpaceInGB > 16 Then
+                CurrentDirectoryTextBlock.Foreground = Brushes.Green
+            ElseIf AvailableSpaceInGB >= 10 Then
+                CurrentDirectoryTextBlock.Foreground = Brushes.Orange
+            Else
+                CurrentDirectoryTextBlock.Foreground = New SolidColorBrush(CType(ColorConverter.ConvertFromString("#FFC12249"), Color))
+            End If
+        End If
+
+        TotalGamesTextBlock.Text = GamePartitionsCount.ToString() + " Games"
+
+        'Load covers after getting the game list
+        If URLs.Count > 0 Then
+            NewLoadingWindow.LoadStatusTextBlock.Text = "Getting " + URLs.Count.ToString() + " available infos with covers."
+            NewLoadingWindow.LoadProgressBar.IsIndeterminate = False
+            NewLoadingWindow.LoadProgressBar.Value = 0
+            NewLoadingWindow.LoadProgressBar.Maximum = URLs.Count
+            NewLoadingWindow.Show()
+            GetGameCovers()
+        Else
+            NewLoadingWindow.Close()
+            GamesListView.Items.Refresh()
+        End If
+    End Function
+
+    ''' <summary>Reads all partitions of the PSX HDD ("hdl_dump toc") into <see cref="Partitions"/>. Returns False after reporting an error.</summary>
+    Private Async Function LoadPartitionsAsync() As Task(Of Boolean)
+        Dim Result As ProcessResult = Await StorageBackend.RunHdlDumpAsync({"toc", StorageBackend.MountedDrive.HDLDriveName}, Nothing, CancellationToken.None)
+        If Not Result.Succeeded Then
+            ShowToolFailure("hdl_dump toc", Result, "Could not read the partition table")
+            Return False
+        End If
+
+        Partitions.Clear()
+        For Each Line As String In OutputText.SplitLines(Result.StandardOutput)
+            If Line.StartsWith("0") Then
+                Dim Columns As String() = Line.Split({" "}, StringSplitOptions.RemoveEmptyEntries)
+                If Columns.Length >= 5 Then
+                    Partitions.Add(New Partition() With {.Type = Columns(0), .Start = Columns(1), .Parts = Columns(2), .Size = Columns(3), .Name = Columns(4)})
+                End If
+            End If
+        Next
+        Return True
+    End Function
 
     Public Function GetPS2GameTitleFromDatabaseList(GameID As String) As String
         Dim FoundGameTitle As String = ""
@@ -410,202 +498,98 @@ Public Class GameLibrary
 
 #Region "Partition Mounting"
 
-    Private Sub MountPartition(PartitionName As String, DriveID As String, VolumeName As String)
-        'Get a free drive letter
-        Dim NewDriveLetter As String = Utils.FindNextAvailableDriveLetter()
-
-        'Mount the drive using pfsfuse
-        Using PFSFuse As New Process()
-            PFSFuse.StartInfo.FileName = My.Computer.FileSystem.CurrentDirectory + "\Tools\pfsfuse.exe"
-            PFSFuse.StartInfo.Arguments = "--partition=" + PartitionName + " " + DriveID + " " + NewDriveLetter + " -o volname=""" + VolumeName + """"
-            PFSFuse.StartInfo.UseShellExecute = False
-            PFSFuse.StartInfo.CreateNoWindow = True
-            PFSFuse.Start()
-        End Using
-
-        'Assign values to the game
-        SelectedGameToModify.AssignedPartitionDriveLetter = NewDriveLetter
-        SelectedGameToModify.PartitionName = PartitionName
+    ''' <summary>Closes the loading window once; closing an already closed window throws.</summary>
+    Private Sub CloseLoadingWindow()
+        If PresentationSource.FromVisual(NewLoadingWindow) IsNot Nothing Then NewLoadingWindow.Close()
     End Sub
 
-    Private Sub HDLDump2_Exited(sender As Object, e As EventArgs) Handles HDLDump2.Exited
-        If ProcessOutputCommand = "ModifyPartition" Then
-            If NewLoadingWindow.Dispatcher.CheckAccess() = False Then
-                NewLoadingWindow.Dispatcher.BeginInvoke(Sub()
-                                                            NewLoadingWindow.LoadStatusTextBlock.Text = "Mounting partition with pfsfuse"
-                                                            NewLoadingWindow.LoadProgressBar.IsIndeterminate = False
-                                                            NewLoadingWindow.LoadProgressBar.Value = 0
-                                                            NewLoadingWindow.LoadProgressBar.Maximum = 7
-                                                        End Sub)
-            Else
-                NewLoadingWindow.LoadStatusTextBlock.Text = "Mounting partition with pfsfuse"
-                NewLoadingWindow.LoadProgressBar.IsIndeterminate = False
-                NewLoadingWindow.LoadProgressBar.Value = 0
-                NewLoadingWindow.LoadProgressBar.Maximum = 7
-            End If
+    ''' <summary>Mounts the PP partition of <paramref name="Game"/> through the backend. Returns False after reporting an error.</summary>
+    Private Async Function MountGamePartitionAsync(Game As PS2Game) As Task(Of Boolean)
+        'Get all partitions to find the game's PP partition
+        If Not Await LoadPartitionsAsync() Then Return False
 
-            For Each Part As Partition In Partitions
-                If Part.Name.StartsWith("PP." + SelectedGameToModify.GameID) Then
-                    'Mount the partition as volume
-                    MountPartition(Part.Name, MountedDrive.DriveID, SelectedGameToModify.GameTitle)
-                    Exit For
-                End If
-            Next
-
-            HDLDump2.CancelOutputRead()
-
-            'Mounting with pfsfuse does have a little delay before the drive shows up in the explorer
-            MountDelay.Start()
-
-        ElseIf ProcessOutputCommand = "DeletePartition" Then
-
-            Dim HiddenGamePartition As String = ""
-            Dim GamePPPartition As String = ""
-
-            For Each Part As Partition In Partitions
-                If Part.Name.StartsWith("PP." + SelectedGameToModify.GameID) Then
-                    GamePPPartition = Part.Name
-                ElseIf Part.Name.StartsWith("__." + SelectedGameToModify.GameID) Then
-                    HiddenGamePartition = Part.Name
-                End If
-            Next
-
-            '
-            'Partitions will be deleted separately in case there's no PP or hidden partition
-            '
-            'Delete the PP partition
-            If Not String.IsNullOrEmpty(GamePPPartition) Then
-
-                'Set rmpart command
-                Using CommandFileWriter As New StreamWriter(My.Computer.FileSystem.CurrentDirectory + "\Tools\cmdlist\rmpart.txt", False)
-                    CommandFileWriter.WriteLine("device " + MountedDrive.DriveID)
-                    CommandFileWriter.WriteLine("rmpart " + GamePPPartition)
-                    CommandFileWriter.WriteLine("exit")
-                End Using
-
-                'Proceed to partition deletion
-                Dim PFSShellOutput As String
-                Using PFSShellProcess As New Process()
-                    PFSShellProcess.StartInfo.FileName = "cmd"
-                    PFSShellProcess.StartInfo.Arguments = """/c type """ + My.Computer.FileSystem.CurrentDirectory + "\Tools\cmdlist\rmpart.txt"" | """ + My.Computer.FileSystem.CurrentDirectory + "\Tools\pfsshell.exe"" 2>&1"
-
-                    PFSShellProcess.StartInfo.RedirectStandardOutput = True
-                    PFSShellProcess.StartInfo.UseShellExecute = False
-                    PFSShellProcess.StartInfo.CreateNoWindow = True
-
-                    PFSShellProcess.Start()
-
-                    Dim ShellReader As StreamReader = PFSShellProcess.StandardOutput
-                    Dim ProcessOutput As String = ShellReader.ReadToEnd()
-
-                    ShellReader.Close()
-                    PFSShellOutput = ProcessOutput
-                End Using
-
-                If PFSShellOutput.Contains("No such file or directory") Then
-                    MsgBox("There was an error while deleting the game partition. More details :" + vbCrLf + PFSShellOutput, MsgBoxStyle.Exclamation, "Error")
-                End If
-            End If
-
-            'Delete the hidden partition
-            If Not String.IsNullOrEmpty(HiddenGamePartition) Then
-
-                'Set rmpart command
-                Using CommandFileWriter As New StreamWriter(My.Computer.FileSystem.CurrentDirectory + "\Tools\cmdlist\rmpart.txt", False)
-                    CommandFileWriter.WriteLine("device " + MountedDrive.DriveID)
-                    CommandFileWriter.WriteLine("rmpart " + HiddenGamePartition)
-                    CommandFileWriter.WriteLine("exit")
-                End Using
-
-                'Proceed to partition deletion
-                Dim PFSShellOutput As String
-                Using PFSShellProcess As New Process()
-                    PFSShellProcess.StartInfo.FileName = "cmd"
-                    PFSShellProcess.StartInfo.Arguments = """/c type """ + My.Computer.FileSystem.CurrentDirectory + "\Tools\cmdlist\rmpart.txt"" | """ + My.Computer.FileSystem.CurrentDirectory + "\Tools\pfsshell.exe"" 2>&1"
-
-                    PFSShellProcess.StartInfo.RedirectStandardOutput = True
-                    PFSShellProcess.StartInfo.UseShellExecute = False
-                    PFSShellProcess.StartInfo.CreateNoWindow = True
-
-                    PFSShellProcess.Start()
-
-                    Dim ShellReader As StreamReader = PFSShellProcess.StandardOutput
-                    Dim ProcessOutput As String = ShellReader.ReadToEnd()
-
-                    ShellReader.Close()
-                    PFSShellOutput = ProcessOutput
-                End Using
-
-                If PFSShellOutput.Contains("No such file or directory") Then
-                    MsgBox("There was an error while deleting the game partition. More details :" + vbCrLf + PFSShellOutput, MsgBoxStyle.Exclamation, "Error")
-                End If
-            End If
-
-            'Reload
-            URLs.Clear()
-            GamePartitions.Clear()
-            HDLDump2.CancelOutputRead()
-
-            If GamesListView.Dispatcher.CheckAccess() = False Then
-                GamesListView.Dispatcher.BeginInvoke(Sub()
-                                                         GamesListView.Items.Clear()
-                                                     End Sub)
-            Else
-                GamesListView.Items.Clear()
-            End If
-
-            If NewLoadingWindow.Dispatcher.CheckAccess() = False Then
-                NewLoadingWindow.Dispatcher.BeginInvoke(Sub()
-                                                            NewLoadingWindow.Close()
-                                                            NewLoadingWindow = New SyncWindow() With {.Title = "Loading games on PSX HDD", .ShowActivated = True, .WindowStartupLocation = WindowStartupLocation.CenterScreen}
-                                                            NewLoadingWindow.LoadProgressBar.IsIndeterminate = True
-                                                            NewLoadingWindow.LoadStatusTextBlock.Text = "Please wait"
-                                                            NewLoadingWindow.Show()
-                                                        End Sub)
-            Else
-                NewLoadingWindow.Close()
-                NewLoadingWindow = New SyncWindow() With {.Title = "Loading games on PSX HDD", .ShowActivated = True, .WindowStartupLocation = WindowStartupLocation.CenterScreen}
-                NewLoadingWindow.LoadProgressBar.IsIndeterminate = True
-                NewLoadingWindow.LoadStatusTextBlock.Text = "Please wait"
-                NewLoadingWindow.Show()
-            End If
-
-            LoadGamePartitions()
+        Dim GamePPPartitionIndex As Integer = Partitions.FindIndex(Function(Part) Part.Name.StartsWith("PP." + Game.GameID))
+        If GamePPPartitionIndex < 0 Then
+            CloseLoadingWindow()
+            MsgBox("Could not mount the selected game.", MsgBoxStyle.Exclamation, "Game partition not found.")
+            Return False
         End If
+
+        Dim GamePPPartition As Partition = Partitions(GamePPPartitionIndex)
+        NewLoadingWindow.LoadStatusTextBlock.Text = "Mounting partition with pfsfuse"
+
+        'The backend waits until the mount is visible in Windows, so no extra delay is needed here
+        Game.MountedPartition = Await StorageBackend.MountPfsPartitionAsync(GamePPPartition.Name, If(String.IsNullOrEmpty(Game.GameTitle), GamePPPartition.Name, Game.GameTitle), CancellationToken.None)
+        Game.PartitionName = GamePPPartition.Name
+        Return True
+    End Function
+
+    Private Sub OpenGamePartitionManager(Game As PS2Game)
+        Dim NewGamePartitionManager As New GamePartitionManager With {.ShowActivated = True,
+            .MountedDrive = StorageBackend.MountedDrive,
+            .StorageBackend = StorageBackend,
+            .MountedPartition = Game.MountedPartition,
+            .AssociatedPartition = Game.PartitionName}
+        NewGamePartitionManager.Show()
     End Sub
 
-    Private Sub MountDelay_Tick(sender As Object, e As EventArgs) Handles MountDelay.Tick
-        If NewLoadingWindow.Dispatcher.CheckAccess() = False Then
-            NewLoadingWindow.Dispatcher.BeginInvoke(Sub()
-                                                        NewLoadingWindow.LoadProgressBar.Value += 1
-                                                    End Sub)
-        Else
-            NewLoadingWindow.LoadProgressBar.Value += 1
-        End If
-
-        If NewLoadingWindow.LoadProgressBar.Value = 7 Then
-            MountDelay.Stop()
-            NewLoadingWindow.Close()
-
-            If String.IsNullOrEmpty(SelectedGameToModify.AssignedPartitionDriveLetter) Then
-                MsgBox("Could not mount the selected game.", MsgBoxStyle.Exclamation, "Game partition not found.")
-            Else
-                Dim NewGamePartitionManager As New GamePartitionManager With {.ShowActivated = True, .AssociatedDriveLetter = SelectedGameToModify.AssignedPartitionDriveLetter, .AssociatedPartition = SelectedGameToModify.PartitionName, .MountedDrive = MountedDrive}
-                NewGamePartitionManager.Show()
-            End If
-
-        End If
+    ''' <summary>A partition was unmounted (by the game partition manager, another window or a disconnect).</summary>
+    Private Sub StorageBackend_MountRemoved(sender As Object, Mount As PfsMountHandle)
+        Dispatcher.BeginInvoke(Sub() RemoveMountedPartition(Mount.MountId))
     End Sub
 
-    Public Sub RemoveDriveLetterFromGame(DriveLetter As String)
+    ''' <summary>Forgets the mount <paramref name="MountId"/> on every listed game that still references it.</summary>
+    Public Sub RemoveMountedPartition(MountId As String)
         For Each Game In GamesListView.Items
-            Dim FoundGame As PS2Game = CType(Game, PS2Game)
-            If FoundGame.AssignedPartitionDriveLetter = DriveLetter Then
-                FoundGame.AssignedPartitionDriveLetter = ""
-                Exit For
+            Dim FoundGame As PS2Game = TryCast(Game, PS2Game)
+            If FoundGame IsNot Nothing AndAlso FoundGame.MountedPartition IsNot Nothing AndAlso FoundGame.MountedPartition.MountId = MountId Then
+                FoundGame.MountedPartition = Nothing
             End If
         Next
     End Sub
+
+    ''' <summary>Deletes the PP and the hidden __. partition of <paramref name="Game"/> with pfsshell.</summary>
+    Private Async Function DeleteGamePartitionsAsync(Game As PS2Game) As Task
+        'Get all partitions to find the PP & hidden partition of the game
+        If Not Await LoadPartitionsAsync() Then Return
+
+        Dim HiddenGamePartition As String = ""
+        Dim GamePPPartition As String = ""
+
+        For Each Part As Partition In Partitions
+            If Part.Name.StartsWith("PP." + Game.GameID) Then
+                GamePPPartition = Part.Name
+            ElseIf Part.Name.StartsWith("__." + Game.GameID) Then
+                HiddenGamePartition = Part.Name
+            End If
+        Next
+
+        If String.IsNullOrEmpty(GamePPPartition) AndAlso String.IsNullOrEmpty(HiddenGamePartition) Then
+            MsgBox("No partition of " + Game.GameID + " was found on the PSX HDD.", MsgBoxStyle.Exclamation, "Error")
+            Return
+        End If
+
+        '
+        'Partitions will be deleted separately in case there's no PP or hidden partition
+        '
+        For Each PartitionToDelete As String In {GamePPPartition, HiddenGamePartition}
+            If String.IsNullOrEmpty(PartitionToDelete) Then Continue For
+
+            'rmpart commands, sent straight to pfsshell
+            Dim Commands As New List(Of String) From {
+                "device " + StorageBackend.MountedDrive.DriveID,
+                "rmpart " + PartitionToDelete,
+                "exit"
+            }
+
+            Dim Result As ProcessResult = Await StorageBackend.RunPfsShellAsync(Commands, Nothing, CancellationToken.None)
+            Dim PFSShellOutput As String = Result.CombinedOutput
+
+            If PFSShellOutput.Contains("No such file or directory") OrElse Result.TimedOut OrElse Result.Cancelled Then
+                MsgBox("There was an error while deleting the game partition. More details :" + vbCrLf + PFSShellOutput.Replace(vbLf, vbCrLf), MsgBoxStyle.Exclamation, "Error")
+            End If
+        Next
+    End Function
 
 #End Region
 
@@ -649,7 +633,7 @@ Public Class GameLibrary
         End If
     End Sub
 
-    Private Sub LoadPSXGamesButton_Click(sender As Object, e As RoutedEventArgs) Handles LoadPSXGamesButton.Click
+    Private Async Sub LoadPSXGamesButton_Click(sender As Object, e As RoutedEventArgs) Handles LoadPSXGamesButton.Click
 
         GameTitleTextBlock.Text = ""
         ReleaseDateTextBlock.Text = ""
@@ -662,8 +646,8 @@ Public Class GameLibrary
         GameIDTextBlock.Text = ""
         GamePartitionsCount = 0
 
-        If MountedDrive.HDLDriveName = "" Then
-            MsgBox("Please connect to the NBD server first.", MsgBoxStyle.Information)
+        If StorageBackend Is Nothing OrElse Not StorageBackend.IsConnected Then
+            MsgBox("Please connect to the PSX HDD first.", MsgBoxStyle.Information)
         Else
             CurrentDirectoryTextBlock.Text = "PSX HDD"
 
@@ -671,21 +655,25 @@ Public Class GameLibrary
             LoadPSXGamesButton.Background = New SolidColorBrush(CType(ColorConverter.ConvertFromString("#FF004671"), Color))
             ReloadButton.Background = New SolidColorBrush(CType(ColorConverter.ConvertFromString("#FF00619C"), Color))
 
-            GamesListView.Items.Clear()
-            URLs.Clear()
-            GamePartitions.Clear()
-
             GamesListView.ContextMenu = Nothing
             GamesListView.ContextMenu = PSXPS2GamesContextMenu
 
-            NewLoadingWindow = New SyncWindow() With {.Title = "Loading games on PSX HDD", .ShowActivated = True, .WindowStartupLocation = WindowStartupLocation.CenterScreen}
-            NewLoadingWindow.LoadProgressBar.IsIndeterminate = True
-            NewLoadingWindow.LoadStatusTextBlock.Text = "Please wait"
-            NewLoadingWindow.Show()
-
-            LoadGamePartitions()
+            Await ReloadPSXGamesAsync()
         End If
     End Sub
+
+    Private Async Function ReloadPSXGamesAsync() As Task
+        GamesListView.Items.Clear()
+        URLs.Clear()
+        GamePartitions.Clear()
+
+        NewLoadingWindow = New SyncWindow() With {.Title = "Loading games on PSX HDD", .ShowActivated = True, .WindowStartupLocation = WindowStartupLocation.CenterScreen}
+        NewLoadingWindow.LoadProgressBar.IsIndeterminate = True
+        NewLoadingWindow.LoadStatusTextBlock.Text = "Please wait"
+        NewLoadingWindow.Show()
+
+        Await LoadGamePartitionsAsync()
+    End Function
 
     Private Sub GamesListView_PreviewMouseWheel(sender As Object, e As MouseWheelEventArgs) Handles GamesListView.PreviewMouseWheel
         'The mouse wheel only scrolls vertically, this code allows scrolling horizontally
@@ -698,113 +686,6 @@ Public Class GameLibrary
 
             If e.Delta < 0 Then
                 GamesListViewScrollViewer.ScrollToHorizontalOffset(GamesListViewScrollViewer.HorizontalOffset + 2)
-            End If
-        End If
-    End Sub
-
-    Public Sub OutputDataHandler(sender As Object, e As DataReceivedEventArgs)
-        If Not String.IsNullOrEmpty(e.Data) Then
-
-            If e.Data.StartsWith("DVD") Or e.Data.StartsWith("CD") Then 'Game found
-                Dim NewPS2Game As New PS2Game()
-
-                Dim GameSize = e.Data.Split({" "}, StringSplitOptions.RemoveEmptyEntries)(1).Trim().Replace("KB", "")
-                Dim GameSizeInMB = CInt(GameSize) / 1024
-
-                Dim GamePart As New GamePartition() With {.Type = e.Data.Split({" "}, StringSplitOptions.RemoveEmptyEntries)(0),
-                    .Size = FormatNumber(GameSizeInMB, 2) + " MB",
-                    .Flags = e.Data.Split({" "}, StringSplitOptions.RemoveEmptyEntries)(2),
-                    .DMA = e.Data.Split({" "}, StringSplitOptions.RemoveEmptyEntries)(3),
-                    .Startup = e.Data.Split({" "}, StringSplitOptions.RemoveEmptyEntries)(4),
-                    .Name = e.Data.Split({"  "}, StringSplitOptions.RemoveEmptyEntries)(2)}
-
-                Dim GameID As String = GamePart.Startup.Replace("_", "-").Replace(".", "")
-
-                GamePartitions.Add(GamePart)
-
-                NewPS2Game.GameSize = GamePart.Size
-                NewPS2Game.GameID = GameID
-
-                If Utils.IsURLValid("https://psxdatacenter.com/psx2/games2/" + GameID + ".html") Then
-                    URLs.Add("https://psxdatacenter.com/psx2/games2/" + GameID + ".html")
-                Else
-                    Dispatcher.BeginInvoke(Sub()
-                                               NewPS2Game.GameCoverSource = New BitmapImage(New Uri("/Images/blankcover.png", UriKind.RelativeOrAbsolute))
-                                           End Sub)
-                    NewPS2Game.GameTitle = GetPS2GameTitleFromDatabaseList(GameID)
-                End If
-
-                'Add to the ListView
-                If GamesListView.Dispatcher.CheckAccess() = False Then
-                    GamesListView.Dispatcher.BeginInvoke(Sub() GamesListView.Items.Add(NewPS2Game))
-                Else
-                    GamesListView.Items.Add(NewPS2Game)
-                End If
-
-                GamePartitionsCount += 1
-
-            ElseIf e.Data.StartsWith("total") Then 'Last line of hdl_dump hdl_toc - Load covers after getting the game list
-                Dim HDDSizes As String() = e.Data.Split({","}, StringSplitOptions.RemoveEmptyEntries)
-                Dim AvailableSpaceInGB = Utils.GetIntOnly(HDDSizes(2)) / 1024
-
-                If Dispatcher.CheckAccess() = False Then
-                    Dispatcher.BeginInvoke(Sub()
-                                               CurrentDirectoryTextBlock.Text = "PSX HDD" + " - Available: " + FormatNumber(AvailableSpaceInGB, 2) + " GB"
-
-                                               'Left space indicator
-                                               If AvailableSpaceInGB > 16 Then
-                                                   CurrentDirectoryTextBlock.Foreground = Brushes.Green
-                                               ElseIf AvailableSpaceInGB >= 10 Then
-                                                   CurrentDirectoryTextBlock.Foreground = Brushes.Orange
-                                               ElseIf AvailableSpaceInGB <= 9 Then
-                                                   CurrentDirectoryTextBlock.Foreground = New SolidColorBrush(CType(ColorConverter.ConvertFromString("#FFC12249"), Color))
-                                               End If
-
-                                               TotalGamesTextBlock.Text = GamePartitionsCount.ToString() + " Games"
-                                               NewLoadingWindow.LoadStatusTextBlock.Text = "Getting " + URLs.Count.ToString() + " available infos with covers."
-                                               NewLoadingWindow.LoadProgressBar.IsIndeterminate = False
-                                               NewLoadingWindow.LoadProgressBar.Value = 0
-                                               NewLoadingWindow.LoadProgressBar.Maximum = URLs.Count
-                                               NewLoadingWindow.Show()
-                                           End Sub)
-                Else
-                    CurrentDirectoryTextBlock.Text = "PSX HDD" + " - Available: " + FormatNumber(AvailableSpaceInGB, 2) + " GB"
-
-                    'Left space indicator
-                    If AvailableSpaceInGB > 16 Then
-                        CurrentDirectoryTextBlock.Foreground = Brushes.Green
-                    ElseIf AvailableSpaceInGB >= 10 Then
-                        CurrentDirectoryTextBlock.Foreground = Brushes.Orange
-                    ElseIf AvailableSpaceInGB <= 9 Then
-                        CurrentDirectoryTextBlock.Foreground = New SolidColorBrush(CType(ColorConverter.ConvertFromString("#FFC12249"), Color))
-                    End If
-
-                    TotalGamesTextBlock.Text = GamePartitionsCount.ToString() + " Games"
-                    NewLoadingWindow.LoadStatusTextBlock.Text = "Getting " + URLs.Count.ToString() + " available infos with covers."
-                    NewLoadingWindow.LoadProgressBar.IsIndeterminate = False
-                    NewLoadingWindow.LoadProgressBar.Value = 0
-                    NewLoadingWindow.LoadProgressBar.Maximum = URLs.Count
-                    NewLoadingWindow.Show()
-                End If
-
-                HDLDump.CancelOutputRead()
-                GetGameCovers()
-            End If
-
-        End If
-    End Sub
-
-    Public Sub FullOutputDataHandler(sender As Object, e As DataReceivedEventArgs)
-        If Not String.IsNullOrEmpty(e.Data) Then
-            If e.Data.StartsWith("0") Then
-
-                Dim Part As New Partition() With {.Type = e.Data.Split({" "}, StringSplitOptions.RemoveEmptyEntries)(0),
-                    .Start = e.Data.Split({" "}, StringSplitOptions.RemoveEmptyEntries)(1),
-                    .Parts = e.Data.Split({" "}, StringSplitOptions.RemoveEmptyEntries)(2),
-                    .Size = e.Data.Split({" "}, StringSplitOptions.RemoveEmptyEntries)(3),
-                    .Name = e.Data.Split({" "}, StringSplitOptions.RemoveEmptyEntries)(4)}
-
-                Partitions.Add(Part)
             End If
         End If
     End Sub
@@ -982,28 +863,36 @@ Public Class GameLibrary
         End If
     End Sub
 
-    Private Sub ModifyPartitionMenuItem_Click(sender As Object, e As RoutedEventArgs) Handles ModifyPartitionMenuItem.Click
+    Private Async Sub ModifyPartitionMenuItem_Click(sender As Object, e As RoutedEventArgs) Handles ModifyPartitionMenuItem.Click
         If GamesListView.SelectedItem IsNot Nothing Then
             Dim SelectedPS2Game As PS2Game = CType(GamesListView.SelectedItem, PS2Game)
 
-            If String.IsNullOrEmpty(SelectedPS2Game.AssignedPartitionDriveLetter) Then 'Game partition not mounted yet
+            If StorageBackend Is Nothing OrElse Not StorageBackend.IsConnected Then
+                MsgBox("Please connect to the PSX HDD first.", MsgBoxStyle.Information)
+                Return
+            End If
+
+            If SelectedPS2Game.MountedPartition Is Nothing Then 'Game partition not mounted yet
                 SelectedGameToModify = SelectedPS2Game
-                ProcessOutputCommand = "ModifyPartition"
 
                 NewLoadingWindow = New SyncWindow() With {.Title = "Loading game partitions", .ShowActivated = True, .WindowStartupLocation = WindowStartupLocation.CenterScreen}
                 NewLoadingWindow.LoadProgressBar.IsIndeterminate = True
                 NewLoadingWindow.LoadStatusTextBlock.Text = "Loading partition"
                 NewLoadingWindow.Show()
 
-                'Get all partitions to find the game's PP partition
-                LoadPartitions()
-            Else
-                Dim NewGamePartitionManager As New GamePartitionManager With {.ShowActivated = True,
-                    .AssociatedDriveLetter = SelectedPS2Game.AssignedPartitionDriveLetter,
-                    .AssociatedPartition = SelectedPS2Game.PartitionName}
-                NewGamePartitionManager.Show()
+                Dim Mounted As Boolean = False
+                Try
+                    Mounted = Await MountGamePartitionAsync(SelectedPS2Game)
+                Catch ex As Exception
+                    CloseLoadingWindow()
+                    ShowError(ex, "Could not mount the selected game")
+                End Try
+                CloseLoadingWindow()
+
+                If Not Mounted Then Return
             End If
 
+            OpenGamePartitionManager(SelectedPS2Game)
         End If
     End Sub
 
@@ -1031,22 +920,38 @@ Public Class GameLibrary
         End If
     End Sub
 
-    Private Sub RemoveMenuItem_Click(sender As Object, e As RoutedEventArgs) Handles RemoveMenuItem.Click
+    Private Async Sub RemoveMenuItem_Click(sender As Object, e As RoutedEventArgs) Handles RemoveMenuItem.Click
         If GamesListView.SelectedItem IsNot Nothing Then
             Dim SelectedPS2Game As PS2Game = CType(GamesListView.SelectedItem, PS2Game)
-            If String.IsNullOrEmpty(SelectedPS2Game.AssignedPartitionDriveLetter) Then 'Check if the game partition is not mounted
-                If MsgBox("Do you really want to remoe the game " + SelectedPS2Game.GameTitle + " ?" + vbCrLf + "This operation could be destructive and should be made on the console !", MsgBoxStyle.YesNo, "Please confirm") = MsgBoxResult.Yes Then
-                    SelectedGameToModify = SelectedPS2Game
-                    ProcessOutputCommand = "DeletePartition"
 
-                    NewLoadingWindow = New SyncWindow() With {.Title = "Removing " + SelectedPS2Game.GameTitle, .ShowActivated = True, .WindowStartupLocation = WindowStartupLocation.CenterScreen}
-                    NewLoadingWindow.LoadProgressBar.IsIndeterminate = True
-                    NewLoadingWindow.LoadStatusTextBlock.Text = "Deleting game, please wait"
-                    NewLoadingWindow.Show()
+            If StorageBackend Is Nothing OrElse Not StorageBackend.IsConnected Then
+                MsgBox("Please connect to the PSX HDD first.", MsgBoxStyle.Information)
+                Return
+            End If
 
-                    'Get all partitions to find the PP & hidden partition of the game and delete them afterwards
-                    LoadPartitions()
-                End If
+            If SelectedPS2Game.MountedPartition IsNot Nothing Then 'The game partition is still mounted
+                MsgBox("The game partition is mounted at " + SelectedPS2Game.MountedPartition.WindowsPath + "." + vbCrLf + "Please unmount it before removing the game.", MsgBoxStyle.Exclamation, "Game partition mounted")
+                Return
+            End If
+
+            If MsgBox("Do you really want to remoe the game " + SelectedPS2Game.GameTitle + " ?" + vbCrLf + "This operation could be destructive and should be made on the console !", MsgBoxStyle.YesNo, "Please confirm") = MsgBoxResult.Yes Then
+                SelectedGameToModify = SelectedPS2Game
+
+                NewLoadingWindow = New SyncWindow() With {.Title = "Removing " + SelectedPS2Game.GameTitle, .ShowActivated = True, .WindowStartupLocation = WindowStartupLocation.CenterScreen}
+                NewLoadingWindow.LoadProgressBar.IsIndeterminate = True
+                NewLoadingWindow.LoadStatusTextBlock.Text = "Deleting game, please wait"
+                NewLoadingWindow.Show()
+
+                Try
+                    Await DeleteGamePartitionsAsync(SelectedPS2Game)
+                Catch ex As Exception
+                    ShowError(ex, "Error")
+                Finally
+                    NewLoadingWindow.Close()
+                End Try
+
+                'Reload
+                If StorageBackend.IsConnected Then Await ReloadPSXGamesAsync()
             End If
         End If
     End Sub

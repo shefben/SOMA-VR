@@ -1,6 +1,7 @@
 ﻿Imports System.ComponentModel
 Imports System.IO
 Imports System.Net
+Imports System.Threading
 Imports System.Windows.Forms
 Imports nQuant
 Imports PSX_XMB_Manager.Structs
@@ -8,10 +9,13 @@ Imports PSX_XMB_Manager.Structs
 Public Class GamePartitionManager
 
     Public MountedDrive As MountedPSXDrive
-    Public AssociatedDriveLetter As String
+    Public StorageBackend As IPSXStorageBackend
+    Public MountedPartition As PfsMountHandle 'The game's PP partition, mounted by the backend
     Public AssociatedPartition As String
 
     Private Unmounted As Boolean = False
+    Private OperationRunning As Boolean = False
+    Private CloseConfirmed As Boolean = False
     Private TextboxChangesDictionary As New Dictionary(Of TextBox, String)
     Private CheckboxChangesDictionary As New Dictionary(Of CheckBox, Boolean?)
     Private ImageChangesDictionary As New Dictionary(Of Image, ImageSource)
@@ -21,48 +25,85 @@ Public Class GamePartitionManager
     Dim WithEvents PartitionLoaderWorker As New BackgroundWorker() With {.WorkerReportsProgress = True}
     Dim WithEvents ContentDownloader As New WebClient()
 
+    ''' <summary>Root of the mounted game partition, as Windows sees it (a drive letter locally, a \\wsl.localhost path in WSL).</summary>
+    Private ReadOnly Property DrivePath As String
+        Get
+            Return MountedPartition.WindowsPath
+        End Get
+    End Property
+
+    Private ReadOnly Property ResPath As String
+        Get
+            Return Path.Combine(MountedPartition.WindowsPath, "res")
+        End Get
+    End Property
+
+    Private Shared Sub ShowError(ex As Exception, title As String)
+        Dim backendError As StorageBackendException = TryCast(ex, StorageBackendException)
+        MsgBox(If(backendError IsNot Nothing, BackendErrorCodes.FormatForUser(backendError), ex.Message), MsgBoxStyle.Critical, title)
+    End Sub
+
+    Private Shared Sub ShowToolFailure(tool As String, result As ProcessResult, title As String)
+        Dim reason As String = If(result.TimedOut, " timed out.", If(result.Cancelled, " was cancelled.", " failed with exit code " + result.ExitCode.ToString() + "."))
+        MsgBox(tool + reason + vbCrLf + vbCrLf + result.CombinedOutput.Trim().Replace(vbLf, vbCrLf), MsgBoxStyle.Exclamation, title)
+    End Sub
+
     Private Sub GamePartitionManager_ContentRendered(sender As Object, e As EventArgs) Handles Me.ContentRendered
         PartitionLoaderWorker.RunWorkerAsync()
     End Sub
 
-    Private Sub GamePartitionManager_Closing(sender As Object, e As CancelEventArgs) Handles Me.Closing
-        If Unmounted = False Then
+    Private Async Sub GamePartitionManager_Closing(sender As Object, e As CancelEventArgs) Handles Me.Closing
+        If CloseConfirmed Then Return
+
+        If OperationRunning Then
+            e.Cancel = True
+            MsgBox("Please wait until the current operation on the PSX HDD is finished.", MsgBoxStyle.Information)
+            Return
+        End If
+
+        If Unmounted = False AndAlso MountedPartition IsNot Nothing Then
             If MsgBox("Do you want to keep the game partition mounted ? This will speed up reading the partition again.", MsgBoxStyle.YesNo, "Keep mounted ?") = MsgBoxResult.No Then
-                UnMountPartition(AssociatedDriveLetter.ToUpper)
-                Utils.RemoveMountedDriveLetter(AssociatedDriveLetter)
+                e.Cancel = True
+                OperationRunning = True
+                'An unmount error is reported; the mount then stays listed by the backend and is removed on disconnect
+                Await UnmountPartitionAsync()
+                OperationRunning = False
+                CloseConfirmed = True
+                Close()
             End If
         End If
     End Sub
 
-    Private Sub UnMountPartition(VolumeLabel As String)
-        If Directory.Exists(My.Computer.FileSystem.SpecialDirectories.ProgramFiles + "\Dokan") Then
-            'Get the Dokan Library folder
-            Dim DokanLibraryFolder As String = ""
-            For Each Folder In Directory.GetDirectories(My.Computer.FileSystem.SpecialDirectories.ProgramFiles + "\Dokan")
-                Dim FolderInfo As New DirectoryInfo(Folder)
-                If FolderInfo.Name.Contains("DokanLibrary") Or FolderInfo.Name.Contains("Dokan Library") Then
-                    DokanLibraryFolder = Folder
-                    Exit For
-                End If
-            Next
-
-            If Not String.IsNullOrEmpty(DokanLibraryFolder) AndAlso File.Exists(DokanLibraryFolder + "\dokanctl.exe") Then
-                Using DokanCTL As New Process()
-                    DokanCTL.StartInfo.FileName = DokanLibraryFolder + "\dokanctl.exe"
-                    DokanCTL.StartInfo.Arguments = "/u " + VolumeLabel
-                    DokanCTL.StartInfo.UseShellExecute = False
-                    DokanCTL.StartInfo.CreateNoWindow = True
-                    DokanCTL.Start()
-                End Using
-            Else
-                MsgBox("Could not unmount the game partition." + vbCrLf + "Cannot find dokanctl.exe at " + My.Computer.FileSystem.SpecialDirectories.ProgramFiles + "\Dokan Library...", MsgBoxStyle.Critical, "Error while unmounting")
-            End If
-        Else
-            MsgBox("Could not unmount the game partition." + vbCrLf + "Cannot find Dokan Library at " + My.Computer.FileSystem.SpecialDirectories.ProgramFiles + "\Dokan Library", MsgBoxStyle.Critical, "Error while unmounting")
-        End If
+    Private Sub GamePartitionManager_Closed(sender As Object, e As EventArgs) Handles Me.Closed
+        If StorageBackend IsNot Nothing Then RemoveHandler StorageBackend.MountRemoved, AddressOf StorageBackend_MountRemoved
     End Sub
+
+    ''' <summary>The partition was unmounted elsewhere (for example by Disconnect).</summary>
+    Private Sub StorageBackend_MountRemoved(sender As Object, Mount As PfsMountHandle)
+        Dispatcher.BeginInvoke(Sub()
+                                   If MountedPartition IsNot Nothing AndAlso Mount.MountId = MountedPartition.MountId Then Unmounted = True
+                               End Sub)
+    End Sub
+
+    ''' <summary>
+    ''' Unmounts the game partition through the backend. The pfsfuse view must be gone before pfsshell or hdl_dump write
+    ''' to the partition. Returns False after reporting an error.
+    ''' </summary>
+    Private Async Function UnmountPartitionAsync() As Task(Of Boolean)
+        If Unmounted OrElse MountedPartition Is Nothing Then Return True
+        Try
+            Await StorageBackend.UnmountPfsPartitionAsync(MountedPartition, CancellationToken.None)
+            Unmounted = True
+            Return True
+        Catch ex As Exception
+            ShowError(ex, "Could not unmount the game partition")
+            Return False
+        End Try
+    End Function
 
     Private Sub GamePartitionManager_Loaded(sender As Object, e As RoutedEventArgs) Handles Me.Loaded
+        If StorageBackend IsNot Nothing Then AddHandler StorageBackend.MountRemoved, AddressOf StorageBackend_MountRemoved
+
         NewLoadingWindow = New SyncWindow() With {.Title = "Loading game partition", .ShowActivated = True, .WindowStartupLocation = WindowStartupLocation.CenterScreen, .Topmost = True}
         NewLoadingWindow.LoadProgressBar.IsIndeterminate = True
         NewLoadingWindow.LoadStatusTextBlock.Text = "Loading game info, please wait"
@@ -70,26 +111,23 @@ Public Class GamePartitionManager
     End Sub
 
     Private Sub PartitionLoaderWorker_DoWork(sender As Object, e As DoWorkEventArgs) Handles PartitionLoaderWorker.DoWork
-        Dim DrivePath As String = AssociatedDriveLetter.ToUpper + ":\"
-        Dim ResPath As String = AssociatedDriveLetter.ToUpper + ":\res"
-
-        If File.Exists(ResPath + "\jkt_001.png") Then
+        If File.Exists(Path.Combine(ResPath, "jkt_001.png")) Then
 
             CoverPictureBox.Dispatcher.BeginInvoke(Sub()
                                                        Dim CoverImage As New BitmapImage()
                                                        CoverImage.BeginInit()
                                                        CoverImage.CreateOptions = BitmapCreateOptions.IgnoreImageCache
                                                        CoverImage.CacheOption = BitmapCacheOption.OnLoad
-                                                       CoverImage.UriSource = New Uri(ResPath + "\jkt_001.png")
+                                                       CoverImage.UriSource = New Uri(Path.Combine(ResPath, "jkt_001.png"))
                                                        CoverImage.EndInit()
                                                        CoverPictureBox.Source = CoverImage
-                                                       CoverPictureBox.Tag = ResPath + "\jkt_001.png"
+                                                       CoverPictureBox.Tag = Path.Combine(ResPath, "jkt_001.png")
                                                    End Sub)
         End If
 
         '\res\info.sys
-        If File.Exists(ResPath + "\info.sys") Then
-            Dim GameInfos As String() = File.ReadAllLines(ResPath + "\info.sys")
+        If File.Exists(Path.Combine(ResPath, "info.sys")) Then
+            Dim GameInfos As String() = File.ReadAllLines(Path.Combine(ResPath, "info.sys"))
 
             GameTitleTextBox.Dispatcher.BeginInvoke(Sub() GameTitleTextBox.Text = GameInfos(0).Split("="c)(1).Trim())
             GameIDTextBox.Dispatcher.BeginInvoke(Sub() GameIDTextBox.Text = GameInfos(1).Split("="c)(1).Replace("_", "-").Replace(".", "").Trim())
@@ -113,9 +151,9 @@ Public Class GamePartitionManager
         End If
 
         '\icon.sys
-        If File.Exists(DrivePath + "\icon.sys") Then
-            Dim Infos As String() = File.ReadAllLines(ResPath + "\info.sys")
-            UninstallMsgTextBox.Dispatcher.BeginInvoke(Sub() UninstallMsgTextBox.Text = Infos(15).Split("="c)(1).Trim())
+        If File.Exists(Path.Combine(DrivePath, "icon.sys")) Then
+            Dim Infos As String() = File.ReadAllLines(Path.Combine(DrivePath, "icon.sys"))
+            If Infos.Length > 15 Then UninstallMsgTextBox.Dispatcher.BeginInvoke(Sub() UninstallMsgTextBox.Text = Infos(15).Split("="c)(1).Trim())
         End If
     End Sub
 
@@ -127,11 +165,15 @@ Public Class GamePartitionManager
         Next
     End Sub
 
-    Private Sub CloseButton_Click(sender As Object, e As RoutedEventArgs) Handles CloseButton.Click
-        UnMountPartition(AssociatedDriveLetter.ToUpper)
-        Utils.RemoveMountedDriveLetter(AssociatedDriveLetter)
-        Unmounted = True
-        Close()
+    Private Async Sub CloseButton_Click(sender As Object, e As RoutedEventArgs) Handles CloseButton.Click
+        If OperationRunning Then Return
+        OperationRunning = True
+        Dim UnmountSucceeded As Boolean = Await UnmountPartitionAsync()
+        OperationRunning = False
+        If UnmountSucceeded Then
+            CloseConfirmed = True
+            Close()
+        End If
     End Sub
 
     Private Sub CoverPictureBox_MouseLeftButtonDown(sender As Object, e As MouseButtonEventArgs) Handles CoverPictureBox.MouseLeftButtonDown
@@ -143,24 +185,32 @@ Public Class GamePartitionManager
         End If
     End Sub
 
-    Private Sub SaveButton_Click(sender As Object, e As RoutedEventArgs) Handles SaveButton.Click
+    Private Async Sub SaveButton_Click(sender As Object, e As RoutedEventArgs) Handles SaveButton.Click
+        If OperationRunning Then Return
+        OperationRunning = True
+        Try
+            Await SaveChangesAsync()
+        Catch ex As Exception
+            ShowError(ex, "Error while saving the game partition")
+        Finally
+            OperationRunning = False
+            Mouse.SetCursor(Input.Cursors.Arrow)
+        End Try
+    End Sub
+
+    Private Async Function SaveChangesAsync() As Task
 
         Mouse.SetCursor(Input.Cursors.Wait)
 
-        'Unmount the partition from pc
-        UnMountPartition(AssociatedDriveLetter.ToUpper)
-        Utils.RemoveMountedDriveLetter(AssociatedDriveLetter)
-        Unmounted = True
-
-        'Create a temporary directory to upload the changes
+        'The changed files are prepared first: the selected pictures may still be read from the mounted partition.
+        'Create a temporary directory to upload the changes (left-overs of an interrupted save are removed first)
         Dim TempDirectory As String = My.Computer.FileSystem.CurrentDirectory + "\Temp"
-        If Not Directory.Exists(TempDirectory) Then
-            Directory.CreateDirectory(TempDirectory)
+        If Directory.Exists(TempDirectory) Then
+            Directory.Delete(TempDirectory, True)
         End If
-        If Not Directory.Exists(TempDirectory + "\res") Then
-            Directory.CreateDirectory(TempDirectory + "\res")
-            Directory.CreateDirectory(TempDirectory + "\res\image")
-        End If
+        Directory.CreateDirectory(TempDirectory)
+        Directory.CreateDirectory(TempDirectory + "\res")
+        Directory.CreateDirectory(TempDirectory + "\res\image")
 
         'PNG compressor
         Dim Quantizer As New WuQuantizer()
@@ -197,7 +247,7 @@ Public Class GamePartitionManager
                     End If
                 End If
                 If Img.Name = "BackgroundImagePictureBox" Then
-                    If Not BackgroundImagePictureBox.Tag IsNot Nothing Then
+                    If BackgroundImagePictureBox.Tag IsNot Nothing Then
                         Dim BackgroundImageBitmap As System.Drawing.Bitmap = Utils.GetResizedBitmap(BackgroundImagePictureBox.Tag.ToString, 640, 350)
 
                         If BackgroundImageBitmap.PixelFormat <> System.Drawing.Imaging.PixelFormat.Format32bppArgb Then
@@ -338,128 +388,69 @@ Public Class GamePartitionManager
             CNFWriter.WriteLine("uninstallmes2=")
         End Using
 
-        'Create a copy of hdl_dump in the temp directory
-        File.Copy(My.Computer.FileSystem.CurrentDirectory + "\Tools\hdl_dump.exe", TempDirectory + "\hdl_dump.exe", True)
+        Try
+            'Unmount the partition from pc; hdl_dump and pfsshell must never write to a partition that pfsfuse still has mounted
+            If Not Await UnmountPartitionAsync() Then Return
 
-        'Switch to temp directory and inject the files
-        Directory.SetCurrentDirectory(TempDirectory)
+            'Modify the partition header (icon.sys); hdl_dump reads the header files from its working directory
+            Dim HDLDumpResult As ProcessResult = Await StorageBackend.RunHdlDumpAsync({"modify_header", StorageBackend.MountedDrive.HDLDriveName, AssociatedPartition}, TempDirectory, CancellationToken.None)
+            Dim HDLDumpOutput As String = HDLDumpResult.CombinedOutput
 
-        'Modify the partition header (icon.sys)
-        Dim HDLDumpOutput As String = ""
-        Using HDLDump As New Process()
-            HDLDump.StartInfo.FileName = "hdl_dump.exe"
-            HDLDump.StartInfo.Arguments = "modify_header " + MountedDrive.HDLDriveName + " " + AssociatedPartition
-            HDLDump.StartInfo.RedirectStandardOutput = True
-            HDLDump.StartInfo.UseShellExecute = False
-            HDLDump.StartInfo.CreateNoWindow = True
-            HDLDump.Start()
+            If HDLDumpOutput.Contains("partition not found:") OrElse Not HDLDumpResult.Succeeded Then
+                MsgBox("There was an error while modifying the partition, please check if you have enough space and report the next error.", MsgBoxStyle.Exclamation, "Error installing game")
+                MsgBox(HDLDumpOutput.Replace(vbLf, vbCrLf))
+                Return
+            End If
 
-            Dim OutputReader As StreamReader = HDLDump.StandardOutput
-            HDLDumpOutput = HDLDump.StandardOutput.ReadToEnd()
-        End Using
+            'Update the files on the partition
+            Dim Kind As StorageBackendKind = StorageBackend.Kind
+            Dim Commands As New List(Of String) From {
+                "device " + StorageBackend.MountedDrive.DriveID,
+                "mount " + AssociatedPartition,
+                "mkdir res", 'continues if it already exists - useful if not present yet
+                "cd res"
+            }
 
-        'Update the files on the partition
-        If Not HDLDumpOutput.Contains("partition not found:") Then
-            'Set the mkdir & put commands
-            Using CommandFileWriter As New StreamWriter(AppDomain.CurrentDomain.BaseDirectory + "Tools\cmdlist\push.txt", False)
-                CommandFileWriter.WriteLine("device " + MountedDrive.DriveID)
-                CommandFileWriter.WriteLine("mount " + AssociatedPartition)
-                CommandFileWriter.WriteLine("mkdir res") 'continues if it already exists - useful if not present yet
-                CommandFileWriter.WriteLine("cd res")
-
-                If File.Exists("res\info.sys") Then
-                    CommandFileWriter.WriteLine("rm info.sys")
-                    CommandFileWriter.WriteLine("put res\info.sys")
-                    CommandFileWriter.WriteLine("rename res\info.sys info.sys")
+            For Each ResFile As String In {"info.sys", "jkt_001.png", "jkt_002.png", "jkt_cp.png", "man.xml", "notice.jpg"}
+                If File.Exists(Path.Combine(TempDirectory, "res", ResFile)) Then
+                    Commands.Add("rm " + ResFile)
+                    Commands.AddRange(PfsShellCommands.PutFile(Kind, "res\" + ResFile))
                 End If
-                If File.Exists("res\jkt_001.png") Then
-                    CommandFileWriter.WriteLine("rm jkt_001.png")
-                    CommandFileWriter.WriteLine("put res\jkt_001.png")
-                    CommandFileWriter.WriteLine("rename res\jkt_001.png jkt_001.png")
-                End If
-                If File.Exists("res\jkt_002.png") Then
-                    CommandFileWriter.WriteLine("rm jkt_002.png")
-                    CommandFileWriter.WriteLine("put res\jkt_002.png")
-                    CommandFileWriter.WriteLine("rename res\jkt_002.png jkt_002.png")
-                End If
-                If File.Exists("res\jkt_cp.png") Then
-                    CommandFileWriter.WriteLine("rm jkt_cp.png")
-                    CommandFileWriter.WriteLine("put res\jkt_cp.png")
-                    CommandFileWriter.WriteLine("rename res\jkt_cp.png jkt_cp.png")
-                End If
-                If File.Exists("res\man.xml") Then
-                    CommandFileWriter.WriteLine("rm man.xml")
-                    CommandFileWriter.WriteLine("put res\man.xml")
-                    CommandFileWriter.WriteLine("rename res\man.xml man.xml")
-                End If
-                If File.Exists("res\notice.jpg") Then
-                    CommandFileWriter.WriteLine("rm notice.jpg")
-                    CommandFileWriter.WriteLine("put res\notice.jpg")
-                    CommandFileWriter.WriteLine("rename res\notice.jpg notice.jpg")
-                End If
+            Next
 
-                If Directory.Exists("res\image") Then
-                    CommandFileWriter.WriteLine("mkdir image")
-                    CommandFileWriter.WriteLine("cd image")
+            If Directory.Exists(Path.Combine(TempDirectory, "res", "image")) Then
+                Commands.Add("mkdir image")
+                Commands.Add("cd image")
 
-                    If File.Exists("res\image\0.png") Then
-                        CommandFileWriter.WriteLine("rm 0.png")
-                        CommandFileWriter.WriteLine("put res\image\0.png")
-                        CommandFileWriter.WriteLine("rename res\image\0.png 0.png")
+                For Each ImageFile As String In {"0.png", "1.png", "2.png"}
+                    If File.Exists(Path.Combine(TempDirectory, "res", "image", ImageFile)) Then
+                        Commands.Add("rm " + ImageFile)
+                        Commands.AddRange(PfsShellCommands.PutFile(Kind, "res\image\" + ImageFile))
                     End If
-                    If File.Exists("res\image\1.png") Then
-                        CommandFileWriter.WriteLine("rm 1.png")
-                        CommandFileWriter.WriteLine("put res\image\1.png")
-                        CommandFileWriter.WriteLine("rename res\image\1.png 1.png")
-                    End If
-                    If File.Exists("res\image\2.png") Then
-                        CommandFileWriter.WriteLine("rm 2.png")
-                        CommandFileWriter.WriteLine("put res\image\2.png")
-                        CommandFileWriter.WriteLine("rename res\image\2.png 2.png")
-                    End If
-                End If
+                Next
+            End If
 
-                CommandFileWriter.WriteLine("umount")
-                CommandFileWriter.WriteLine("exit")
-            End Using
+            Commands.Add("umount")
+            Commands.Add("exit")
 
-            'Put all detected files to the partition
-            Using PFSShellProcess As New Process()
-                PFSShellProcess.StartInfo.FileName = "cmd"
-                PFSShellProcess.StartInfo.Arguments = """/c type """ + AppDomain.CurrentDomain.BaseDirectory + "Tools\cmdlist\push.txt"" | """ + AppDomain.CurrentDomain.BaseDirectory + "Tools\pfsshell.exe"" 2>&1"
-                PFSShellProcess.StartInfo.UseShellExecute = False
-                PFSShellProcess.StartInfo.CreateNoWindow = True
-                PFSShellProcess.Start()
-                PFSShellProcess.WaitForExit()
-            End Using
-        Else
-            MsgBox("There was an error while modifying the partition, please check if you have enough space and report the next error.", MsgBoxStyle.Exclamation, "Error installing game")
-            MsgBox(HDLDumpOutput)
-
-            'Set the current directory back
-            Directory.SetCurrentDirectory(AppDomain.CurrentDomain.BaseDirectory)
-
+            'Put all detected files to the partition, from the temp directory
+            Dim PFSShellResult As ProcessResult = Await StorageBackend.RunPfsShellAsync(Commands, TempDirectory, CancellationToken.None)
+            If PFSShellResult.TimedOut OrElse PFSShellResult.Cancelled OrElse PFSShellResult.ExitCode <> 0 Then
+                ShowToolFailure("pfsshell", PFSShellResult, "Error while saving the game partition")
+                Return
+            End If
+        Finally
             'Remove the temporary folder
             If Directory.Exists(TempDirectory) Then
                 Directory.Delete(TempDirectory, True)
             End If
-
-            Mouse.SetCursor(Input.Cursors.Arrow)
-            Exit Sub
-        End If
-
-        'Set the current directory back
-        Directory.SetCurrentDirectory(AppDomain.CurrentDomain.BaseDirectory)
-
-        'Remove the temporary folder
-        If Directory.Exists(TempDirectory) Then
-            Directory.Delete(TempDirectory, True)
-        End If
+        End Try
 
         Mouse.SetCursor(Input.Cursors.Arrow)
         MsgBox("Done ! This window will be closed, please re-mount the game partition to load the changes.", MsgBoxStyle.Information)
+        CloseConfirmed = True
         Close()
-    End Sub
+    End Function
 
     Private Sub LoadFromPSXButton_Click(sender As Object, e As RoutedEventArgs) Handles LoadFromPSXButton.Click
         Try
@@ -581,102 +572,92 @@ Public Class GamePartitionManager
         End Try
     End Sub
 
-    Private Sub UpdateExecuteKELFButton_Click(sender As Object, e As RoutedEventArgs) Handles UpdateExecuteKELFButton.Click
-
-        'Unmount the partition from pc
-        UnMountPartition(AssociatedDriveLetter.ToUpper)
-        Utils.RemoveMountedDriveLetter(AssociatedDriveLetter)
+    Private Async Sub UpdateExecuteKELFButton_Click(sender As Object, e As RoutedEventArgs) Handles UpdateExecuteKELFButton.Click
+        If OperationRunning Then Return
+        OperationRunning = True
+        Mouse.SetCursor(Input.Cursors.Wait)
 
         'Create a temporary directory to upload the changes
         Dim TempDirectory As String = My.Computer.FileSystem.CurrentDirectory + "\Temp"
-        If Not Directory.Exists(TempDirectory) Then
-            Directory.CreateDirectory(TempDirectory)
-        End If
 
-        'Download latest OPL-Launcher
-        ContentDownloader.DownloadFile("https://github.com/ps2homebrew/OPL-Launcher/releases/download/latest/OPL-Launcher.elf", My.Computer.FileSystem.CurrentDirectory + "\Tools\OPL-Launcher.elf")
+        Try
+            'Unmount the partition from pc
+            If Not Await UnmountPartitionAsync() Then Return
 
-        'Wrap OPL-Launcher as EXECUTE.KELF
-        Dim WrapProcess As New Process()
-        WrapProcess.StartInfo.FileName = My.Computer.FileSystem.CurrentDirectory + "\Tools\SCEDoormat_NoME.exe"
-        WrapProcess.StartInfo.Arguments = """" + My.Computer.FileSystem.CurrentDirectory + "\Tools\OPL-Launcher.elf"" """ + TempDirectory + "\EXECUTE.KELF"""
-        WrapProcess.StartInfo.CreateNoWindow = True
-        WrapProcess.Start()
-        WrapProcess.WaitForExit()
+            If Not Directory.Exists(TempDirectory) Then
+                Directory.CreateDirectory(TempDirectory)
+            End If
 
-        'Create a copy of hdl_dump in the temp directory
-        File.Copy(My.Computer.FileSystem.CurrentDirectory + "\Tools\hdl_dump.exe", TempDirectory + "\hdl_dump.exe", True)
+            'Download latest OPL-Launcher
+            Await ContentDownloader.DownloadFileTaskAsync("https://github.com/ps2homebrew/OPL-Launcher/releases/download/latest/OPL-Launcher.elf", My.Computer.FileSystem.CurrentDirectory + "\Tools\OPL-Launcher.elf")
 
-        'Switch to temp directory and inject the new EXECUTE.KELF
-        Directory.SetCurrentDirectory(TempDirectory)
+            'Wrap OPL-Launcher as EXECUTE.KELF
+            Using WrapProcess As New Process()
+                WrapProcess.StartInfo.FileName = My.Computer.FileSystem.CurrentDirectory + "\Tools\SCEDoormat_NoME.exe"
+                WrapProcess.StartInfo.Arguments = """" + My.Computer.FileSystem.CurrentDirectory + "\Tools\OPL-Launcher.elf"" """ + TempDirectory + "\EXECUTE.KELF"""
+                WrapProcess.StartInfo.CreateNoWindow = True
+                WrapProcess.Start()
+                Await Task.Run(Sub() WrapProcess.WaitForExit())
+            End Using
 
-        'Modify the partition header
-        Dim HDLDumpOutput As String = ""
-        Using HDLDump As New Process()
-            HDLDump.StartInfo.FileName = "hdl_dump.exe"
-            HDLDump.StartInfo.Arguments = "modify_header " + MountedDrive.HDLDriveName + " " + AssociatedPartition
-            HDLDump.StartInfo.RedirectStandardOutput = True
-            HDLDump.StartInfo.UseShellExecute = False
-            HDLDump.StartInfo.CreateNoWindow = True
-            HDLDump.Start()
+            'Modify the partition header; hdl_dump picks up the new EXECUTE.KELF from its working directory
+            Dim HDLDumpResult As ProcessResult = Await StorageBackend.RunHdlDumpAsync({"modify_header", StorageBackend.MountedDrive.HDLDriveName, AssociatedPartition}, TempDirectory, CancellationToken.None)
 
-            Dim OutputReader As StreamReader = HDLDump.StandardOutput
-            HDLDumpOutput = HDLDump.StandardOutput.ReadToEnd()
-        End Using
+            If Not HDLDumpResult.CombinedOutput.Contains("partition not found:") AndAlso HDLDumpResult.Succeeded Then
+                MsgBox("Done")
+            Else
+                ShowToolFailure("hdl_dump modify_header", HDLDumpResult, "Error while updating EXECUTE.KELF")
+            End If
+        Catch ex As Exception
+            ShowError(ex, "Error while updating EXECUTE.KELF")
+        Finally
+            OperationRunning = False
+            Mouse.SetCursor(Input.Cursors.Arrow)
 
-        'Update the files on the partition
-        If Not HDLDumpOutput.Contains("partition not found:") Then
-            MsgBox("Done")
-        End If
-
-        'Set the current directory back
-        Directory.SetCurrentDirectory(AppDomain.CurrentDomain.BaseDirectory)
-        Mouse.SetCursor(Input.Cursors.Arrow)
-
-        'Remove the temporary folder
-        If Directory.Exists(TempDirectory) Then
-            Directory.Delete(TempDirectory, True)
-        End If
+            'Remove the temporary folder
+            If Directory.Exists(TempDirectory) Then
+                Directory.Delete(TempDirectory, True)
+            End If
+        End Try
 
     End Sub
 
     Private Sub LoadAdditionalImagesButton_Click(sender As Object, e As RoutedEventArgs) Handles LoadAdditionalImagesButton.Click
-        Dim DrivePath As String = AssociatedDriveLetter.ToUpper + ":\"
-        Dim ResPath As String = AssociatedDriveLetter.ToUpper + ":\res"
+        Dim ImagePath As String = Path.Combine(ResPath, "image")
 
         If MsgBox("Do you really want to load the background & screenshot images ? This can take some time.", MsgBoxStyle.YesNo, "Loading required") = MsgBoxResult.Yes Then
-            If File.Exists(ResPath + "\image\0.png") Then
+            If File.Exists(Path.Combine(ImagePath, "0.png")) Then
                 Dim BGImage As New BitmapImage()
                 BGImage.BeginInit()
                 BGImage.CreateOptions = BitmapCreateOptions.IgnoreImageCache
                 BGImage.CacheOption = BitmapCacheOption.OnLoad
-                BGImage.UriSource = New Uri(ResPath + "\image\0.png")
+                BGImage.UriSource = New Uri(Path.Combine(ImagePath, "0.png"))
                 BGImage.EndInit()
 
                 BackgroundImagePictureBox.Source = BGImage
-                BackgroundImagePictureBox.Tag = ResPath + "\image\0.png"
+                BackgroundImagePictureBox.Tag = Path.Combine(ImagePath, "0.png")
             End If
-            If File.Exists(ResPath + "\image\1.png") Then
+            If File.Exists(Path.Combine(ImagePath, "1.png")) Then
                 Dim Screenshot1Image As New BitmapImage()
                 Screenshot1Image.BeginInit()
                 Screenshot1Image.CreateOptions = BitmapCreateOptions.IgnoreImageCache
                 Screenshot1Image.CacheOption = BitmapCacheOption.OnLoad
-                Screenshot1Image.UriSource = New Uri(ResPath + "\image\1.png")
+                Screenshot1Image.UriSource = New Uri(Path.Combine(ImagePath, "1.png"))
                 Screenshot1Image.EndInit()
 
                 ScreenshotImage1PictureBox.Source = Screenshot1Image
-                ScreenshotImage1PictureBox.Tag = ResPath + "\image\1.png"
+                ScreenshotImage1PictureBox.Tag = Path.Combine(ImagePath, "1.png")
             End If
-            If File.Exists(ResPath + "\image\2.png") Then
+            If File.Exists(Path.Combine(ImagePath, "2.png")) Then
                 Dim Screenshot2Image As New BitmapImage()
                 Screenshot2Image.BeginInit()
                 Screenshot2Image.CreateOptions = BitmapCreateOptions.IgnoreImageCache
                 Screenshot2Image.CacheOption = BitmapCacheOption.OnLoad
-                Screenshot2Image.UriSource = New Uri(ResPath + "\image\2.png")
+                Screenshot2Image.UriSource = New Uri(Path.Combine(ImagePath, "2.png"))
                 Screenshot2Image.EndInit()
 
                 ScreenshotImage2PictureBox.Source = Screenshot2Image
-                ScreenshotImage2PictureBox.Tag = ResPath + "\image\2.png"
+                ScreenshotImage2PictureBox.Tag = Path.Combine(ImagePath, "2.png")
             End If
         End If
 

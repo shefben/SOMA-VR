@@ -286,7 +286,7 @@ Public NotInheritable Class BackendErrorCodes
             Case SizeMismatch
                 Return "Only restore a backup that was made from this exact HDD size."
             Case StaleMountState, DisconnectFailed
-                Return "Use 'Recover WSL Connection' to clean up the old mount, then connect again."
+                Return "Use 'Recover Connection' to clean up the old mount, then connect again."
             Case OperationTimeout
                 Return "The PSX did not answer in time. Check the network connection and try again."
             Case NotConnected
@@ -554,6 +554,50 @@ Public NotInheritable Class OutputText
     End Function
 End Class
 
+''' <summary>One game line of "hdl_dump hdl_toc".</summary>
+Public Class HdlTocGame
+    Public Property Type As String = ""
+    Public Property SizeInKB As Long
+    Public Property Flags As String = ""
+    Public Property DMA As String = ""
+    Public Property Startup As String = ""
+    Public Property Name As String = ""
+End Class
+
+Public NotInheritable Class HdlTocParser
+
+    ' hdl_dump prints each game as "%3s %7luKB %*s %-3s %-12s %s": type, size, compatibility flags (right aligned,
+    ' "0" when none), DMA ("*u4", "*m2" or blank), startup ELF (padded to 12) and the title, which may contain spaces.
+    Private Shared ReadOnly GameLine As New Regex("^(?<type>DVD|CD ) +(?<size>\d+)KB +(?<flags>0|\d+(?:\+\d+)*) (?<dma>\*[mu]\d|   ) (?<rest>.*)$", RegexOptions.CultureInvariant)
+
+    ''' <summary>
+    ''' Parses a game line. The title starts after the padded startup column, so titles with spaces and CD entries
+    ''' parse correctly. Splitting on double spaces only finds the title at index 2 when the size column happens to have
+    ''' exactly seven digits; for a 19530KB CD it returned " 0 *u4 SLUS_123.45" instead of the title.
+    ''' </summary>
+    Public Shared Function TryParseGameLine(line As String, ByRef game As HdlTocGame) As Boolean
+        game = Nothing
+        If String.IsNullOrEmpty(line) Then Return False
+        Dim match As Match = GameLine.Match(line.TrimEnd(ControlChars.Cr, ControlChars.Lf))
+        If Not match.Success Then Return False
+
+        Dim rest As String = match.Groups("rest").Value
+        Dim space As Integer = rest.IndexOf(" "c)
+        Dim startup As String = If(space < 0, rest, rest.Substring(0, space))
+        Dim nameStart As Integer = Math.Max(12, startup.Length) + 1
+
+        game = New HdlTocGame With {
+            .Type = match.Groups("type").Value.Trim(),
+            .SizeInKB = Long.Parse(match.Groups("size").Value, Globalization.CultureInfo.InvariantCulture),
+            .Flags = match.Groups("flags").Value,
+            .DMA = match.Groups("dma").Value.Trim(),
+            .Startup = startup,
+            .Name = If(rest.Length > nameStart, rest.Substring(nameStart), "")
+        }
+        Return True
+    End Function
+End Class
+
 Public NotInheritable Class WslOutputParsers
 
     ''' <summary>Parses "wsl.exe --list --quiet".</summary>
@@ -788,6 +832,21 @@ Public NotInheritable Class BackendLog
     Public Shared Sub Note(backend As StorageBackendKind, distro As String, message As String)
         Write(backend, distro, "note", message, Nothing, TimeSpan.Zero, "")
     End Sub
+
+    ''' <summary>Saves a complete tool transcript (for example the WSL bootstrap) next to the logs; returns its path or "".</summary>
+    Public Shared Function SaveTranscript(prefix As String, text As String) As String
+        Try
+            Dim fileName As String = prefix + "-" + DateTime.Now.ToString("yyyyMMdd-HHmmss", Globalization.CultureInfo.InvariantCulture) + ".log"
+            Dim target As String = Path.Combine(LogDirectory, fileName)
+            SyncLock SyncRoot
+                Directory.CreateDirectory(LogDirectory)
+                File.WriteAllText(target, If(text, "").Replace(vbCrLf, vbLf).Replace(vbLf, vbCrLf), New UTF8Encoding(False))
+            End SyncLock
+            Return target
+        Catch
+            Return ""
+        End Try
+    End Function
 
     Private Shared Function Truncate(text As String) As String
         Dim value As String = text.Replace(vbCrLf, vbLf).Replace(vbLf, vbLf + "    ")

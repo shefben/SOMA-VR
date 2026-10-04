@@ -1,5 +1,6 @@
 ﻿Imports PSX_XMB_Manager.Structs
 Imports PSX_XMB_Manager.Utils
+Imports System.ComponentModel
 Imports System.IO
 Imports System.Text.RegularExpressions
 Imports System.Threading
@@ -7,8 +8,8 @@ Imports System.Threading
 Public Class InstallWindow
 
     Public MountedDrive As MountedPSXDrive = Nothing
+    Public StorageBackend As IPSXStorageBackend
 
-    Private WithEvents HDL_Dump As New Process()
     Private HDLGameID As String = ""
 
     Public ProjectToInstall As ComboBoxProjectItem = Nothing
@@ -18,8 +19,11 @@ Public Class InstallWindow
     Public InstallForPS1 As Boolean = False
     Public InstallForPS2 As Boolean = False
 
+    Private InstallRunning As Boolean = False
+    Private InjectCancellation As CancellationTokenSource
+
     Private Sub InstallWindow_Loaded(sender As Object, e As RoutedEventArgs) Handles Me.Loaded
-        If String.IsNullOrEmpty(MountedDrive.DriveID) Then
+        If StorageBackend Is Nothing OrElse Not StorageBackend.IsConnected OrElse String.IsNullOrEmpty(MountedDrive.DriveID) Then
             MsgBox("No HDD connected, installation will be aborted.", MsgBoxStyle.Critical, "Error while trying to install")
             Close()
         Else
@@ -77,68 +81,109 @@ Public Class InstallWindow
         End If
     End Sub
 
-    Private Sub InstallWindow_ContentRendered(sender As Object, e As EventArgs) Handles Me.ContentRendered
-        Thread.Sleep(200)
-        If InstallForPS2 Then
-            InstallPS2Game()
-        ElseIf InstallForPS1 Then
-            InstallPS1Game()
+    Private Async Sub InstallWindow_ContentRendered(sender As Object, e As EventArgs) Handles Me.ContentRendered
+        If StorageBackend Is Nothing OrElse Not StorageBackend.IsConnected OrElse ProjectToInstall Is Nothing Then Return
+        Await Task.Delay(200)
+
+        InstallRunning = True
+        Try
+            If InstallForPS2 Then
+                Await InstallPS2GameAsync()
+            ElseIf InstallForPS1 Then
+                Await InstallPS1GameAsync()
+            Else
+                Await InstallAppAsync()
+            End If
+        Catch ex As Exception
+            Dim BackendError As StorageBackendException = TryCast(ex, StorageBackendException)
+            MsgBox(If(BackendError IsNot Nothing, BackendErrorCodes.FormatForUser(BackendError), ex.Message), MsgBoxStyle.Critical, "Error while installing")
+            SetStatus("")
+        Finally
+            InstallRunning = False
+            Mouse.SetCursor(Cursors.Arrow)
+        End Try
+    End Sub
+
+    Private Sub InstallWindow_Closing(sender As Object, e As CancelEventArgs) Handles Me.Closing
+        If Not InstallRunning Then Return
+
+        e.Cancel = True
+        If InjectCancellation IsNot Nothing Then
+            If MsgBox("Cancel the game injection?" + vbCrLf + "hdl_dump stops safely and the game will not be added.", MsgBoxStyle.YesNo Or MsgBoxStyle.Question, "Cancel installation") = MsgBoxResult.Yes Then
+                InjectCancellation.Cancel()
+            End If
         Else
-            InstallApp()
+            MsgBox("The installation is writing to the PSX HDD." + vbCrLf + "Please wait until it has finished.", MsgBoxStyle.Exclamation, "Please wait")
         End If
     End Sub
 
-    Public Sub InstallApp()
-        'Check if drive is already identified, if not get the drive name
-        If String.IsNullOrEmpty(MountedDrive.HDLDriveName) Then
-            MountedDrive.HDLDriveName = GetHDLDriveName()
-            'Retry
-            InstallApp()
-        Else
-            If ProjectToInstall IsNot Nothing Then
-                'Proceed to installation on HDD
+    ''' <summary>Closes the window from inside the installation flow (the flow returns right after).</summary>
+    Private Sub CloseWindow()
+        InstallRunning = False
+        Close()
+    End Sub
 
-                'Get homebrew properties
-                Dim HomebrewTitle As String = File.ReadAllLines(ProjectToInstall.ProjectFile)(0).Split("="c)(1)
-                Dim HomebrewELF As String = File.ReadAllLines(ProjectToInstall.ProjectFile)(3).Split("="c)(1)
-                Dim HomebrewPartition As String
+    Private Sub SetStatus(Text As String)
+        InstallationStatusTextBlock.Text = Text
+    End Sub
 
-                CurrentProjectDirectory = File.ReadAllLines(ProjectToInstall.ProjectFile)(2).Split("="c)(1)
+    ''' <summary>hdl_dump's device name for the connected HDD (hdd#: locally, the NBD raw file in WSL).</summary>
+    Private ReadOnly Property HDLDriveName As String
+        Get
+            Return MountedDrive.HDLDriveName
+        End Get
+    End Property
 
-                'Set a PP partition name on known homebrew
-                If HomebrewTitle.Contains("Open PS2 Loader") Or HomebrewTitle.Contains("OPL") Then
-                    HomebrewPartition = "PP.APPS-00001..OPL"
-                ElseIf HomebrewTitle.Contains("LaunchELF") Or HomebrewTitle.Contains("uLE") Or HomebrewTitle.Contains("wLE") Then
-                    HomebrewPartition = "PP.APPS-00002..WLE"
-                ElseIf HomebrewTitle.Contains("hdl_srv") Or HomebrewTitle.Contains("hdl_server") Or HomebrewTitle.Contains("hdl server") Then
-                    HomebrewPartition = "PP.APPS-00003..HDL"
-                ElseIf HomebrewTitle.Contains("SMS") Or HomebrewTitle.Contains("Simple Media System") Then
-                    HomebrewPartition = "PP.APPS-00004..SMS"
-                ElseIf HomebrewTitle.Contains("GSM") Then
-                    HomebrewPartition = "PP.APPS-00005..GSM"
-                Else
-                    'Set own PP partition name
-                    HomebrewPartition = InputBox("Please enter a valid partition name:", "Could not determine partition for this homebrew.", "PP.APPS-00001..TITLE")
-                End If
+    Private Shared Function DescribeFailure(Tool As String, Result As ProcessResult) As String
+        Dim Reason As String = If(Result.TimedOut, " timed out.", If(Result.Cancelled, " was cancelled.", " failed with exit code " + Result.ExitCode.ToString() + "."))
+        Return Tool + Reason + vbCrLf + vbCrLf + Result.CombinedOutput.Trim().Replace(vbLf, vbCrLf)
+    End Function
 
-                'Update UI
-                If Dispatcher.CheckAccess() = False Then
-                    Dispatcher.BeginInvoke(Sub() InstallationStatusTextBlock.Text = "Creating partition, please wait...")
-                Else
-                    InstallationStatusTextBlock.Text = "Creating partition, please wait..."
-                End If
+    Public Async Function InstallAppAsync() As Task
+        If String.IsNullOrEmpty(HDLDriveName) Then
+            MsgBox("Could not determine the HDD drive name of the connected PSX HDD.", MsgBoxStyle.Critical, "Error while installing homebrew")
+            Return
+        End If
 
-                If Not String.IsNullOrEmpty(HomebrewPartition) Then
-                    CreateHomebrewPartition(HomebrewPartition)
-                Else
-                    MsgBox("Partition name cannot be empty! Please try again.", MsgBoxStyle.Exclamation, "Error")
-                    Exit Sub
-                End If
+        If ProjectToInstall IsNot Nothing Then
+            'Proceed to installation on HDD
+
+            'Get homebrew properties
+            Dim HomebrewTitle As String = File.ReadAllLines(ProjectToInstall.ProjectFile)(0).Split("="c)(1)
+            Dim HomebrewELF As String = File.ReadAllLines(ProjectToInstall.ProjectFile)(3).Split("="c)(1)
+            Dim HomebrewPartition As String
+
+            CurrentProjectDirectory = File.ReadAllLines(ProjectToInstall.ProjectFile)(2).Split("="c)(1)
+
+            'Set a PP partition name on known homebrew
+            If HomebrewTitle.Contains("Open PS2 Loader") Or HomebrewTitle.Contains("OPL") Then
+                HomebrewPartition = "PP.APPS-00001..OPL"
+            ElseIf HomebrewTitle.Contains("LaunchELF") Or HomebrewTitle.Contains("uLE") Or HomebrewTitle.Contains("wLE") Then
+                HomebrewPartition = "PP.APPS-00002..WLE"
+            ElseIf HomebrewTitle.Contains("hdl_srv") Or HomebrewTitle.Contains("hdl_server") Or HomebrewTitle.Contains("hdl server") Then
+                HomebrewPartition = "PP.APPS-00003..HDL"
+            ElseIf HomebrewTitle.Contains("SMS") Or HomebrewTitle.Contains("Simple Media System") Then
+                HomebrewPartition = "PP.APPS-00004..SMS"
+            ElseIf HomebrewTitle.Contains("GSM") Then
+                HomebrewPartition = "PP.APPS-00005..GSM"
+            Else
+                'Set own PP partition name
+                HomebrewPartition = InputBox("Please enter a valid partition name:", "Could not determine partition for this homebrew.", "PP.APPS-00001..TITLE")
+            End If
+
+            'Update UI
+            SetStatus("Creating partition, please wait...")
+
+            If Not String.IsNullOrEmpty(HomebrewPartition) Then
+                Await CreateHomebrewPartitionAsync(HomebrewPartition)
+            Else
+                MsgBox("Partition name cannot be empty! Please try again.", MsgBoxStyle.Exclamation, "Error")
+                Return
             End If
         End If
-    End Sub
+    End Function
 
-    Public Sub InstallPS2Game()
+    Public Async Function InstallPS2GameAsync() As Task
         If ProjectToInstall IsNot Nothing Then
             'Proceed to installation on HDD
             'Get game properties
@@ -149,31 +194,42 @@ Public Class InstallWindow
             HDLGameID = File.ReadAllLines(ProjectToInstall.ProjectFile)(1).Split("="c)(1).Replace("_", "-").Replace(".", "").Trim()
             CurrentProjectDirectory = File.ReadAllLines(ProjectToInstall.ProjectFile)(2).Split("="c)(1)
 
-            'Set up hdl_dump
-            HDL_Dump = New Process()
-            HDL_Dump.StartInfo.FileName = My.Computer.FileSystem.CurrentDirectory + "\Tools\hdl_dump.exe"
-            HDL_Dump.StartInfo.RedirectStandardOutput = True
-            AddHandler HDL_Dump.OutputDataReceived, AddressOf HDLDumpOutputDataHandler
-            HDL_Dump.StartInfo.UseShellExecute = False
-            HDL_Dump.StartInfo.CreateNoWindow = True
-            HDL_Dump.EnableRaisingEvents = True
+            'The ISO path as the backend's hdl_dump sees it (unchanged locally, /mnt/... inside WSL); it must exist there
+            Dim BackendISOPath As String = Await StorageBackend.ConvertWindowsPathAsync(GameISO, CancellationToken.None, mustExist:=True)
 
             'Check if it's a CD or DVD and start injecting the game
-            If GetDiscType(GameISO) = DiscType.DVD Then
-                HDL_Dump.StartInfo.Arguments = "inject_dvd " + MountedDrive.HDLDriveName + " """ + GameTitle + """ """ + GameISO + """ " + GameID + " *u4 -hide"
-                HDL_Dump.Start()
-                HDL_Dump.BeginOutputReadLine()
-            Else
-                HDL_Dump.StartInfo.Arguments = "inject_cd " + MountedDrive.HDLDriveName + " """ + GameTitle + """ """ + GameISO + """ " + GameID + " *u4 -hide"
-                HDL_Dump.Start()
-                HDL_Dump.BeginOutputReadLine()
+            Dim InjectCommand As String = If(GetDiscType(GameISO) = DiscType.DVD, "inject_dvd", "inject_cd")
+            Dim InjectProgress As New Progress(Of String)(AddressOf ShowInjectProgress)
+            Dim Result As ProcessResult
+
+            InjectCancellation = New CancellationTokenSource()
+            Try
+                Result = Await StorageBackend.RunHdlDumpAsync({InjectCommand, HDLDriveName, GameTitle, BackendISOPath, GameID, "*u4", "-hide"},
+                                                              Nothing, InjectCancellation.Token, InjectProgress)
+            Finally
+                InjectCancellation.Dispose()
+                InjectCancellation = Nothing
+            End Try
+
+            If Result.Cancelled Then
+                MsgBox("The installation was cancelled. hdl_dump stopped before adding the game.", MsgBoxStyle.Information, "Installation cancelled")
+                CloseWindow()
+                Return
+            ElseIf Not Result.Succeeded Then
+                MsgBox(DescribeFailure("hdl_dump " + InjectCommand, Result), MsgBoxStyle.Exclamation, "Error installing game")
+                SetStatus("")
+                Return
             End If
+
+            'Proceed to the creation of the game's PP partition
+            SetStatus("Creating game PP partition ...")
+            Await CreateGamePartitionAsync()
         Else
             MsgBox("Could not load the project to install.", MsgBoxStyle.Critical, "Error")
         End If
-    End Sub
+    End Function
 
-    Public Sub InstallPS1Game()
+    Public Async Function InstallPS1GameAsync() As Task
         If ProjectToInstall IsNot Nothing Then
             'Proceed to installation on HDD
             'Get game properties
@@ -191,22 +247,25 @@ Public Class InstallWindow
 
                         If PPPartitionName.Contains("+") Then
                             MsgBox("A + sign has been detected in the partition name and will be replaced with ""_"".", MsgBoxStyle.Information, "Unallowed character detected")
-                            PPPartitionName.Replace("+", "_")
+                            PPPartitionName = PPPartitionName.Replace("+", "_")
                         End If
 
                         'Trim the final PPPartitionName
                         PPPartitionName = PPPartitionName.Trim()
                     Else
                         MsgBox("Partition name is too long. Please retry the installation with a shorter name.", MsgBoxStyle.Critical, "Partition name invalid")
-                        Close()
+                        CloseWindow()
+                        Return
                     End If
                 Else
                     MsgBox("Partition name needs to start with ""PP."". Please retry the installation.", MsgBoxStyle.Critical, "Partition name invalid")
-                    Close()
+                    CloseWindow()
+                    Return
                 End If
             Else
                 MsgBox("No partition name entered. Exiting installation.", MsgBoxStyle.Critical, "Partition name invalid")
-                Close()
+                CloseWindow()
+                Return
             End If
 
             'Calculate the required partition size
@@ -230,96 +289,52 @@ Public Class InstallWindow
 
             If MsgBox("A new partition " + PPPartitionName + " with " + GameRequiredPartitionSizeInMB.ToString() + "M will be created." + vbCrLf + "Do you want to proceed with the installation ?", MsgBoxStyle.YesNo, "Please confirm") = MsgBoxResult.Yes Then
 
-                '1. Set mkpart command for the PP partition
-                Using CommandFileWriter As New StreamWriter(My.Computer.FileSystem.CurrentDirectory + "\Tools\cmdlist\mkpart.txt", False)
-                    CommandFileWriter.WriteLine("device " + MountedDrive.DriveID)
-                    CommandFileWriter.WriteLine("mkpart " + PPPartitionName + " " + GameRequiredPartitionSizeInMB.ToString() + "M PFS")
-                    CommandFileWriter.WriteLine("exit")
-                End Using
+                '1. mkpart commands for the PP partition
+                Dim Commands As New List(Of String) From {
+                    "device " + MountedDrive.DriveID,
+                    "mkpart " + PPPartitionName + " " + GameRequiredPartitionSizeInMB.ToString() + "M PFS",
+                    "exit"
+                }
 
-                'Update UI 
-                If Dispatcher.CheckAccess() = False Then
-                    Dispatcher.BeginInvoke(Sub() InstallationStatusTextBlock.Text = "Creating game partition...")
-                Else
-                    InstallationStatusTextBlock.Text = "Creating game partition..."
-                End If
-
-                Thread.Sleep(200)
+                'Update UI
+                SetStatus("Creating game partition...")
 
                 '2. Proceed to partition creation
-                Dim PFSShellOutput As String
-                Using PFSShellProcess As New Process()
-                    PFSShellProcess.StartInfo.FileName = "cmd"
-                    PFSShellProcess.StartInfo.Arguments = """/c type """ + My.Computer.FileSystem.CurrentDirectory + "\Tools\cmdlist\mkpart.txt"" | """ + My.Computer.FileSystem.CurrentDirectory + "\Tools\pfsshell.exe"" 2>&1"
-
-                    PFSShellProcess.StartInfo.RedirectStandardOutput = True
-                    PFSShellProcess.StartInfo.UseShellExecute = False
-                    PFSShellProcess.StartInfo.CreateNoWindow = True
-
-                    PFSShellProcess.Start()
-
-                    Dim ShellReader As StreamReader = PFSShellProcess.StandardOutput
-                    Dim ProcessOutput As String = ShellReader.ReadToEnd()
-
-                    ShellReader.Close()
-                    PFSShellOutput = ProcessOutput
-                End Using
+                Dim Result As ProcessResult = Await StorageBackend.RunPfsShellAsync(Commands, Nothing, CancellationToken.None)
+                Dim PFSShellOutput As String = Result.CombinedOutput
 
                 '3. Read partition creation output
                 If PFSShellOutput.Contains("created.") Then
-
-                    If Dispatcher.CheckAccess() = False Then
-                        Dispatcher.BeginInvoke(Sub() InstallationStatusTextBlock.Text = PPPartitionName + " created. Now adding files ...")
-                    Else
-                        InstallationStatusTextBlock.Text = PPPartitionName + " created. Now adding files ..."
-                    End If
-
-                    Thread.Sleep(200)
+                    SetStatus(PPPartitionName + " created. Now adding files ...")
 
                     '4. Add files to the partition
-                    PS1AddFilesToPartition(PPPartitionName)
+                    Await PS1AddFilesToPartitionAsync(PPPartitionName)
                 Else
                     MsgBox("There was an error in creating the game's PP partition, please check if the name doesn't already exists and if you have enough space.", MsgBoxStyle.Exclamation, "Error installing game")
-
-                    If Dispatcher.CheckAccess() = False Then
-                        Dispatcher.BeginInvoke(Sub() InstallationStatusTextBlock.Text = "")
-                    Else
-                        InstallationStatusTextBlock.Text = ""
-                    End If
-
-                    Exit Sub
+                    SetStatus("")
+                    Return
                 End If
             Else
                 MsgBox("Exiting game installation.", MsgBoxStyle.Critical, "Installation aborted")
-                Close()
+                CloseWindow()
             End If
         Else
             MsgBox("Could not load the project to install.", MsgBoxStyle.Critical, "Error")
         End If
-    End Sub
+    End Function
 
-    Private Sub CreateGamePartition()
+    Private Async Function CreateGamePartitionAsync() As Task
         Dim CreatedGamePartition As String = ""
 
         'Get the created partition
         '1. List partitions
-        Dim QueryOutput As String()
-        Using HDLDump As New Process()
-            HDLDump.StartInfo.FileName = My.Computer.FileSystem.CurrentDirectory + "\Tools\hdl_dump.exe"
-            HDLDump.StartInfo.Arguments = "toc " + MountedDrive.HDLDriveName
-            HDLDump.StartInfo.RedirectStandardOutput = True
-            HDLDump.StartInfo.UseShellExecute = False
-            HDLDump.StartInfo.CreateNoWindow = True
-            HDLDump.Start()
-
-            Dim OutputReader As StreamReader = HDLDump.StandardOutput
-            QueryOutput = OutputReader.ReadToEnd().Split({vbCrLf}, StringSplitOptions.None)
-        End Using
+        Dim TocResult As ProcessResult = Await StorageBackend.RunHdlDumpAsync({"toc", HDLDriveName}, Nothing, CancellationToken.None)
+        Dim QueryOutput As String() = OutputText.SplitLines(TocResult.StandardOutput)
 
         '2. Search for the created hidden partition
         For Each HDDPartition As String In QueryOutput
             If Not String.IsNullOrEmpty(HDDPartition) Then
-                If HDDPartition.Split(New String() {" "}, StringSplitOptions.RemoveEmptyEntries).Count >= 3 Then
+                If HDDPartition.Split(New String() {" "}, StringSplitOptions.RemoveEmptyEntries).Count >= 5 Then
                     HDDPartition = HDDPartition.Split(New String() {" "}, StringSplitOptions.RemoveEmptyEntries)(4)
                     If HDDPartition.Trim().StartsWith("__." + HDLGameID) Then 'The created hidden partition
                         CreatedGamePartition = HDDPartition.Trim()
@@ -329,420 +344,193 @@ Public Class InstallWindow
             End If
         Next
 
-        '3. Set mkpart command for the PP partition
-        Using CommandFileWriter As New StreamWriter(My.Computer.FileSystem.CurrentDirectory + "\Tools\cmdlist\mkpart.txt", False)
-            CommandFileWriter.WriteLine("device " + MountedDrive.DriveID)
-            CommandFileWriter.WriteLine("mkpart " + CreatedGamePartition.Replace("__.", "PP.") + " 128M PFS")
-            CommandFileWriter.WriteLine("exit")
-        End Using
+        If String.IsNullOrEmpty(CreatedGamePartition) Then
+            MsgBox("Could not find the game's hidden partition __." + HDLGameID + " on the HDD after the injection." + vbCrLf + vbCrLf +
+                   TocResult.CombinedOutput.Trim().Replace(vbLf, vbCrLf), MsgBoxStyle.Exclamation, "Error installing game")
+            SetStatus("")
+            Return
+        End If
+
+        '3. mkpart commands for the PP partition
+        Dim Commands As New List(Of String) From {
+            "device " + MountedDrive.DriveID,
+            "mkpart " + CreatedGamePartition.Replace("__.", "PP.") + " 128M PFS",
+            "exit"
+        }
 
         '4. Proceed to partition creation
-        Dim PFSShellOutput As String
-        Using PFSShellProcess As New Process()
-            PFSShellProcess.StartInfo.FileName = "cmd"
-            PFSShellProcess.StartInfo.Arguments = """/c type """ + My.Computer.FileSystem.CurrentDirectory + "\Tools\cmdlist\mkpart.txt"" | """ + My.Computer.FileSystem.CurrentDirectory + "\Tools\pfsshell.exe"" 2>&1"
-
-            PFSShellProcess.StartInfo.RedirectStandardOutput = True
-            PFSShellProcess.StartInfo.UseShellExecute = False
-            PFSShellProcess.StartInfo.CreateNoWindow = True
-
-            PFSShellProcess.Start()
-
-            Dim ShellReader As StreamReader = PFSShellProcess.StandardOutput
-            Dim ProcessOutput As String = ShellReader.ReadToEnd()
-
-            ShellReader.Close()
-            PFSShellOutput = ProcessOutput
-        End Using
+        Dim Result As ProcessResult = Await StorageBackend.RunPfsShellAsync(Commands, Nothing, CancellationToken.None)
+        Dim PFSShellOutput As String = Result.CombinedOutput
 
         '5. Read partition creation output
         If PFSShellOutput.Contains("Main partition of 128M created.") Then
-
-            If Dispatcher.CheckAccess() = False Then
-                Dispatcher.BeginInvoke(Sub() InstallationStatusTextBlock.Text = "Partition created, modifying header...")
-            Else
-                InstallationStatusTextBlock.Text = "Partition created, modifying header..."
-            End If
+            SetStatus("Partition created, modifying header...")
 
             '6. Modify the created partition
-            ModifyPartitionHeader(CreatedGamePartition.Replace("__.", "PP."), False)
+            Await ModifyPartitionHeaderAsync(CreatedGamePartition.Replace("__.", "PP."), False)
         Else
             MsgBox("There was an error in creating the game's PP partition, please check if the name doesn't already exists and if you have enough space.", MsgBoxStyle.Exclamation, "Error installing game")
-
-            If Dispatcher.CheckAccess() = False Then
-                Dispatcher.BeginInvoke(Sub() InstallationStatusTextBlock.Text = "")
-            Else
-                InstallationStatusTextBlock.Text = ""
-            End If
-
-            Exit Sub
+            SetStatus("")
+            Return
         End If
-    End Sub
+    End Function
 
-    Public Sub CreateHomebrewPartition(PartitionName As String)
+    Public Async Function CreateHomebrewPartitionAsync(PartitionName As String) As Task
         If ProjectToInstall IsNot Nothing Then
-            Dim ProjectDirectory As String = File.ReadAllLines(ProjectToInstall.ProjectFile)(2).Split("="c)(1)
-
-            '1. Set mkpart command for the PP partition
-            Using CommandFileWriter As New StreamWriter(My.Computer.FileSystem.CurrentDirectory + "\Tools\cmdlist\mkpart.txt", False)
-                CommandFileWriter.WriteLine("device " + MountedDrive.DriveID)
-                CommandFileWriter.WriteLine("mkpart " + PartitionName + " 128M PFS")
-                CommandFileWriter.WriteLine("exit")
-            End Using
+            '1. mkpart commands for the PP partition
+            Dim Commands As New List(Of String) From {
+                "device " + MountedDrive.DriveID,
+                "mkpart " + PartitionName + " 128M PFS",
+                "exit"
+            }
 
             '2. Proceed to partition creation
-            Dim PFSShellOutput As String
-            Using PFSShellProcess As New Process()
-                PFSShellProcess.StartInfo.FileName = "cmd"
-                PFSShellProcess.StartInfo.Arguments = """/c type """ + My.Computer.FileSystem.CurrentDirectory + "\Tools\cmdlist\mkpart.txt"" | """ + My.Computer.FileSystem.CurrentDirectory + "\Tools\pfsshell.exe"" 2>&1"
-
-                PFSShellProcess.StartInfo.RedirectStandardOutput = True
-                PFSShellProcess.StartInfo.UseShellExecute = False
-
-                PFSShellProcess.Start()
-
-                Dim ShellReader As StreamReader = PFSShellProcess.StandardOutput
-                Dim ProcessOutput As String = ShellReader.ReadToEnd()
-
-                ShellReader.Close()
-                PFSShellOutput = ProcessOutput
-            End Using
+            Dim Result As ProcessResult = Await StorageBackend.RunPfsShellAsync(Commands, Nothing, CancellationToken.None)
+            Dim PFSShellOutput As String = Result.CombinedOutput
 
             '3. Read partition creation output
             If PFSShellOutput.Contains("Main partition of 128M created.") Then
-                InstallationStatusTextBlock.Text = "Partition created, modifying header..."
+                SetStatus("Partition created, modifying header...")
 
                 '4. Modify the created partition
-                ModifyPartitionHeader(PartitionName, False)
+                Await ModifyPartitionHeaderAsync(PartitionName, False)
             Else
                 MsgBox("There was an error in creating the homebrew's PP partition." + vbCrLf + "Please check if the partition name '" + PartitionName + "' does not already exists of if HDD space is sufficient.", MsgBoxStyle.Exclamation, "Error while installing homebrew")
-                Close()
+                CloseWindow()
             End If
         End If
-    End Sub
+    End Function
 
-    Public Sub ModifyPartitionHeader(PartitionName As String, FinalizePS1 As Boolean)
-        '1. Create a copy of hdl_dump in the project directory
-        File.Copy(My.Computer.FileSystem.CurrentDirectory + "\Tools\hdl_dump.exe", CurrentProjectDirectory + "\hdl_dump.exe", True)
+    Public Async Function ModifyPartitionHeaderAsync(PartitionName As String, FinalizePS1 As Boolean) As Task
+        '1./2. hdl_dump modify_header reads system.cnf, icon.sys, list.ico, ... from its working directory,
+        'so it runs with the project directory as its own working directory (no copy of hdl_dump, no global directory change)
+        Dim Result As ProcessResult = Await StorageBackend.RunHdlDumpAsync({"modify_header", HDLDriveName, PartitionName}, CurrentProjectDirectory, CancellationToken.None)
+        Dim HDLDumpOutput As String = Result.CombinedOutput
 
-        '2. Switch to project directory and inject the files
-        Directory.SetCurrentDirectory(CurrentProjectDirectory)
-
-        '3. Modify the partition header using hdl_dump
-        Dim HDLDumpOutput As String = ""
-        Using HDLDump As New Process()
-            HDLDump.StartInfo.FileName = "hdl_dump.exe"
-            HDLDump.StartInfo.Arguments = "modify_header " + MountedDrive.HDLDriveName + " " + PartitionName
-            HDLDump.StartInfo.RedirectStandardOutput = True
-            HDLDump.StartInfo.UseShellExecute = False
-            HDLDump.StartInfo.CreateNoWindow = True
-            HDLDump.Start()
-
-            HDLDumpOutput = HDLDump.StandardOutput.ReadToEnd()
-        End Using
-
-        '4. Read hdl_dump output
-        If Not HDLDumpOutput.Contains("partition not found:") Then
+        '3. Read hdl_dump output
+        If Not HDLDumpOutput.Contains("partition not found:") AndAlso Result.Succeeded Then
             If FinalizePS1 Then
-
-                'Set the current directory back
-                Directory.SetCurrentDirectory(AppDomain.CurrentDomain.BaseDirectory)
-
-                If InstallationStatusTextBlock.Dispatcher.CheckAccess() = False Then
-                    InstallationStatusTextBlock.Dispatcher.BeginInvoke(Sub() InstallationStatusTextBlock.Text = "Partition header modified. Installation is done!")
-                Else
-                    InstallationStatusTextBlock.Text = "Partition header modified. Installation is done!"
-                End If
+                SetStatus("Partition header modified. Installation is done!")
 
                 If MsgBox("Installation completed with success!", MsgBoxStyle.OkOnly, "Success") = MsgBoxResult.Ok Then
-                    If Dispatcher.CheckAccess() = False Then
-                        Dispatcher.BeginInvoke(Sub() Close())
-                    Else
-                        Close()
-                    End If
+                    CloseWindow()
                 End If
             Else
-                If InstallationStatusTextBlock.Dispatcher.CheckAccess() = False Then
-                    InstallationStatusTextBlock.Dispatcher.BeginInvoke(Sub() InstallationStatusTextBlock.Text = "Partition header modified, adding files...")
-                Else
-                    InstallationStatusTextBlock.Text = "Partition header modified, adding files..."
-                End If
+                SetStatus("Partition header modified, adding files...")
 
-                '5. Add files to the partition
-                PS2AddFilesToPartition(PartitionName)
+                '4. Add files to the partition
+                Await PS2AddFilesToPartitionAsync(PartitionName)
             End If
         Else
-            MsgBox("There was an error while modifying the partition, please check if you have enough space and report the next error." + vbCrLf + HDLDumpOutput, MsgBoxStyle.Exclamation, "Error installing game")
-            'Set the current directory back
-            Directory.SetCurrentDirectory(AppDomain.CurrentDomain.BaseDirectory)
-            Exit Sub
+            MsgBox("There was an error while modifying the partition, please check if you have enough space and report the next error." + vbCrLf + HDLDumpOutput.Replace(vbLf, vbCrLf), MsgBoxStyle.Exclamation, "Error installing game")
+            Return
         End If
-    End Sub
+    End Function
 
-    Public Sub PS2AddFilesToPartition(PartitionName As String)
+    ''' <summary>pfsshell commands that upload the project's res folder (and res\image) into the current PFS directory.</summary>
+    Private Function ResFolderCommands() As List(Of String)
+        Dim Kind As StorageBackendKind = StorageBackend.Kind
+        Dim Commands As New List(Of String) From {"mkdir res", "cd res"}
+
+        For Each ResFile As String In {"info.sys", "jkt_001.png", "jkt_002.png", "jkt_cp.png", "man.xml", "notice.jpg"}
+            If File.Exists(Path.Combine(CurrentProjectDirectory, "res", ResFile)) Then
+                Commands.AddRange(PfsShellCommands.PutFile(Kind, "res\" + ResFile))
+            End If
+        Next
+
+        If Directory.Exists(Path.Combine(CurrentProjectDirectory, "res", "image")) Then
+            Commands.Add("mkdir image")
+            Commands.Add("cd image")
+
+            For Each ImageFile As String In {"0.png", "1.png", "2.png"}
+                If File.Exists(Path.Combine(CurrentProjectDirectory, "res", "image", ImageFile)) Then
+                    Commands.AddRange(PfsShellCommands.PutFile(Kind, "res\image\" + ImageFile))
+                End If
+            Next
+        End If
+
+        Return Commands
+    End Function
+
+    Public Async Function PS2AddFilesToPartitionAsync(PartitionName As String) As Task
         'Now put the "res" folder and EXECUTE.KELF file into the partition
-        Dim PFSShellOutput As String
+        Dim Commands As New List(Of String) From {
+            "device " + MountedDrive.DriveID,
+            "mount " + PartitionName,
+            "put EXECUTE.KELF"
+        }
+        Commands.AddRange(ResFolderCommands())
+        Commands.Add("umount")
+        Commands.Add("exit")
 
-        'Set the mkdir & put commands
-        Using CommandFileWriter As New StreamWriter(AppDomain.CurrentDomain.BaseDirectory + "Tools\cmdlist\push.txt", False)
-            CommandFileWriter.WriteLine("device " + MountedDrive.DriveID)
-            CommandFileWriter.WriteLine("mount " + PartitionName)
-            CommandFileWriter.WriteLine("put EXECUTE.KELF")
-            CommandFileWriter.WriteLine("mkdir res")
-            CommandFileWriter.WriteLine("cd res")
-
-            If File.Exists("res\info.sys") Then
-                CommandFileWriter.WriteLine("put res\info.sys")
-                CommandFileWriter.WriteLine("rename res\info.sys info.sys")
-            End If
-            If File.Exists("res\jkt_001.png") Then
-                CommandFileWriter.WriteLine("put res\jkt_001.png")
-                CommandFileWriter.WriteLine("rename res\jkt_001.png jkt_001.png")
-            End If
-            If File.Exists("res\jkt_002.png") Then
-                CommandFileWriter.WriteLine("put res\jkt_002.png")
-                CommandFileWriter.WriteLine("rename res\jkt_002.png jkt_002.png")
-            End If
-            If File.Exists("res\jkt_cp.png") Then
-                CommandFileWriter.WriteLine("put res\jkt_cp.png")
-                CommandFileWriter.WriteLine("rename res\jkt_cp.png jkt_cp.png")
-            End If
-            If File.Exists("res\man.xml") Then
-                CommandFileWriter.WriteLine("put res\man.xml")
-                CommandFileWriter.WriteLine("rename res\man.xml man.xml")
-            End If
-            If File.Exists("res\notice.jpg") Then
-                CommandFileWriter.WriteLine("put res\notice.jpg")
-                CommandFileWriter.WriteLine("rename res\notice.jpg notice.jpg")
-            End If
-
-            If Directory.Exists("res\image") Then
-                CommandFileWriter.WriteLine("mkdir image")
-                CommandFileWriter.WriteLine("cd image")
-
-                If File.Exists("res\image\0.png") Then
-                    CommandFileWriter.WriteLine("put res\image\0.png")
-                    CommandFileWriter.WriteLine("rename res\image\0.png 0.png")
-                End If
-                If File.Exists("res\image\1.png") Then
-                    CommandFileWriter.WriteLine("put res\image\1.png")
-                    CommandFileWriter.WriteLine("rename res\image\1.png 1.png")
-                End If
-                If File.Exists("res\image\2.png") Then
-                    CommandFileWriter.WriteLine("put res\image\2.png")
-                    CommandFileWriter.WriteLine("rename res\image\2.png 2.png")
-                End If
-            End If
-
-            CommandFileWriter.WriteLine("umount")
-            CommandFileWriter.WriteLine("exit")
-        End Using
-
-        'Put all detected files to the partition using pfsshell
-        Using PFSShellProcess As New Process()
-            PFSShellProcess.StartInfo.FileName = "cmd"
-            PFSShellProcess.StartInfo.Arguments = """/c type """ + AppDomain.CurrentDomain.BaseDirectory + "Tools\cmdlist\push.txt"" | """ + AppDomain.CurrentDomain.BaseDirectory + "Tools\pfsshell.exe"" 2>&1"
-            PFSShellProcess.StartInfo.RedirectStandardOutput = True
-            PFSShellProcess.StartInfo.UseShellExecute = False
-            PFSShellProcess.StartInfo.CreateNoWindow = True
-
-            PFSShellProcess.Start()
-            PFSShellProcess.WaitForExit()
-
-            Dim PFSShellReader As StreamReader = PFSShellProcess.StandardOutput
-            Dim ProcessOutput As String = PFSShellReader.ReadToEnd()
-
-            PFSShellReader.Close()
-            PFSShellOutput = ProcessOutput
-        End Using
+        'Put all detected files to the partition using pfsshell, from the project directory
+        Dim Result As ProcessResult = Await StorageBackend.RunPfsShellAsync(Commands, CurrentProjectDirectory, CancellationToken.None)
 
         'Update UI when finished
-        If Dispatcher.CheckAccess() = False Then
-            Dispatcher.BeginInvoke(Sub() InstallationStatusTextBlock.Text = "")
-        Else
-            InstallationStatusTextBlock.Text = ""
-        End If
+        SetStatus("")
 
-        'Set the current directory back
-        Directory.SetCurrentDirectory(AppDomain.CurrentDomain.BaseDirectory)
+        If Result.TimedOut OrElse Result.ExitCode <> 0 Then
+            MsgBox(DescribeFailure("pfsshell", Result), MsgBoxStyle.Exclamation, "Error adding files")
+            Return
+        End If
 
         If MsgBox("Installation completed with success!", MsgBoxStyle.OkOnly, "Success") = MsgBoxResult.Ok Then
-            If Dispatcher.CheckAccess() = False Then
-                'Owned by different thread
-                Dispatcher.BeginInvoke(Sub() Close())
-            Else
-                Close()
-            End If
+            CloseWindow()
         End If
-    End Sub
+    End Function
 
-    Public Sub PS1AddFilesToPartition(PartitionName As String)
-
-        'Switch to project directory and add the files
-        Directory.SetCurrentDirectory(CurrentProjectDirectory)
-
+    Public Async Function PS1AddFilesToPartitionAsync(PartitionName As String) As Task
         'Now put the game VCD(s), (DISCS.TXT) the "res" folder and EXECUTE.KELF file into the partition
-        Dim PFSShellOutput As String
+        Dim Commands As New List(Of String) From {
+            "device " + MountedDrive.DriveID,
+            "mount " + PartitionName,
+            "put EXECUTE.KELF"
+        }
 
-        'Set the mkdir & put commands
-        Using CommandFileWriter As New StreamWriter(AppDomain.CurrentDomain.BaseDirectory + "Tools\cmdlist\push.txt", False)
-            CommandFileWriter.WriteLine("device " + MountedDrive.DriveID)
-            CommandFileWriter.WriteLine("mount " + PartitionName)
-            CommandFileWriter.WriteLine("put EXECUTE.KELF")
-
-            If File.Exists("DISCS.TXT") Then
-                CommandFileWriter.WriteLine("put DISCS.TXT")
+        For Each GameFile As String In {"DISCS.TXT", "IMAGE0.VCD", "IMAGE1.VCD", "IMAGE2.VCD", "IMAGE3.VCD"}
+            If File.Exists(Path.Combine(CurrentProjectDirectory, GameFile)) Then
+                Commands.Add("put " + GameFile)
             End If
+        Next
 
-            If File.Exists("IMAGE0.VCD") Then
-                CommandFileWriter.WriteLine("put IMAGE0.VCD")
-            End If
+        Commands.AddRange(ResFolderCommands())
+        Commands.Add("umount")
+        Commands.Add("exit")
 
-            If File.Exists("IMAGE1.VCD") Then
-                CommandFileWriter.WriteLine("put IMAGE1.VCD")
-            End If
-
-            If File.Exists("IMAGE2.VCD") Then
-                CommandFileWriter.WriteLine("put IMAGE2.VCD")
-            End If
-
-            If File.Exists("IMAGE3.VCD") Then
-                CommandFileWriter.WriteLine("put IMAGE3.VCD")
-            End If
-
-            CommandFileWriter.WriteLine("mkdir res")
-            CommandFileWriter.WriteLine("cd res")
-
-            If File.Exists("res\info.sys") Then
-                CommandFileWriter.WriteLine("put res\info.sys")
-                CommandFileWriter.WriteLine("rename res\info.sys info.sys")
-            End If
-            If File.Exists("res\jkt_001.png") Then
-                CommandFileWriter.WriteLine("put res\jkt_001.png")
-                CommandFileWriter.WriteLine("rename res\jkt_001.png jkt_001.png")
-            End If
-            If File.Exists("res\jkt_002.png") Then
-                CommandFileWriter.WriteLine("put res\jkt_002.png")
-                CommandFileWriter.WriteLine("rename res\jkt_002.png jkt_002.png")
-            End If
-            If File.Exists("res\jkt_cp.png") Then
-                CommandFileWriter.WriteLine("put res\jkt_cp.png")
-                CommandFileWriter.WriteLine("rename res\jkt_cp.png jkt_cp.png")
-            End If
-            If File.Exists("res\man.xml") Then
-                CommandFileWriter.WriteLine("put res\man.xml")
-                CommandFileWriter.WriteLine("rename res\man.xml man.xml")
-            End If
-            If File.Exists("res\notice.jpg") Then
-                CommandFileWriter.WriteLine("put res\notice.jpg")
-                CommandFileWriter.WriteLine("rename res\notice.jpg notice.jpg")
-            End If
-
-            If Directory.Exists("res\image") Then
-                CommandFileWriter.WriteLine("mkdir image")
-                CommandFileWriter.WriteLine("cd image")
-
-                If File.Exists("res\image\0.png") Then
-                    CommandFileWriter.WriteLine("put res\image\0.png")
-                    CommandFileWriter.WriteLine("rename res\image\0.png 0.png")
-                End If
-                If File.Exists("res\image\1.png") Then
-                    CommandFileWriter.WriteLine("put res\image\1.png")
-                    CommandFileWriter.WriteLine("rename res\image\1.png 1.png")
-                End If
-                If File.Exists("res\image\2.png") Then
-                    CommandFileWriter.WriteLine("put res\image\2.png")
-                    CommandFileWriter.WriteLine("rename res\image\2.png 2.png")
-                End If
-            End If
-
-            CommandFileWriter.WriteLine("umount")
-            CommandFileWriter.WriteLine("exit")
-        End Using
-
-        If Dispatcher.CheckAccess() = False Then
-            Dispatcher.BeginInvoke(Sub() InstallationStatusTextBlock.Text = "Adding files... This can take some time.")
-        Else
-            InstallationStatusTextBlock.Text = "Adding files... This can take some time."
-        End If
-
+        SetStatus("Adding files... This can take some time.")
         Mouse.SetCursor(Cursors.Wait)
-        Thread.Sleep(200)
 
-        'Put all detected files to the partition using pfsshell
-        Using PFSShellProcess As New Process()
-            PFSShellProcess.StartInfo.FileName = "cmd"
-            PFSShellProcess.StartInfo.Arguments = """/c type """ + AppDomain.CurrentDomain.BaseDirectory + "Tools\cmdlist\push.txt"" | """ + AppDomain.CurrentDomain.BaseDirectory + "Tools\pfsshell.exe"" 2>&1"
-            PFSShellProcess.StartInfo.RedirectStandardOutput = True
-            PFSShellProcess.StartInfo.UseShellExecute = False
-            PFSShellProcess.StartInfo.CreateNoWindow = True
-
-            PFSShellProcess.Start()
-            PFSShellProcess.WaitForExit()
-
-            Dim PFSShellReader As StreamReader = PFSShellProcess.StandardOutput
-            Dim ProcessOutput As String = PFSShellReader.ReadToEnd()
-
-            PFSShellReader.Close()
-            PFSShellOutput = ProcessOutput
-        End Using
-
-        'Update UI when finished
-        If Dispatcher.CheckAccess() = False Then
-            Dispatcher.BeginInvoke(Sub() InstallationStatusTextBlock.Text = "Files added to the game partition. Finalizing...")
-        Else
-            InstallationStatusTextBlock.Text = "Files added to the game partition. Finalizing..."
-        End If
+        'Put all detected files to the partition using pfsshell, from the project directory
+        Dim Result As ProcessResult = Await StorageBackend.RunPfsShellAsync(Commands, CurrentProjectDirectory, CancellationToken.None)
 
         Mouse.SetCursor(Cursors.Arrow)
-        Thread.Sleep(200)
 
-        'Set the current directory back
-        Directory.SetCurrentDirectory(AppDomain.CurrentDomain.BaseDirectory)
+        If Result.TimedOut OrElse Result.ExitCode <> 0 Then
+            MsgBox(DescribeFailure("pfsshell", Result), MsgBoxStyle.Exclamation, "Error adding files")
+            SetStatus("")
+            Return
+        End If
+
+        'Update UI when finished
+        SetStatus("Files added to the game partition. Finalizing...")
 
         '5. Modify the partition header
-        ModifyPartitionHeader(PartitionName, True)
-    End Sub
+        Await ModifyPartitionHeaderAsync(PartitionName, True)
+    End Function
 
-    Public Sub HDLDumpOutputDataHandler(sender As Object, e As DataReceivedEventArgs)
-        If Not String.IsNullOrEmpty(e.Data) Then
+    ''' <summary>Shows hdl_dump's injection progress lines and percentage.</summary>
+    Private Sub ShowInjectProgress(Line As String)
+        If String.IsNullOrWhiteSpace(Line) Then Return
 
-            'Update UI and show hdl_dump installation progress
+        'Progress status
+        InstallationStatusTextBlock.Text = Line.Trim()
 
-            'Progress status
-            If InstallationStatusTextBlock.CheckAccess() = False Then
-                InstallationStatusTextBlock.Dispatcher.BeginInvoke(Sub() InstallationStatusTextBlock.Text = e.Data)
-            Else
-                InstallationStatusTextBlock.Text = e.Data
+        'Progress percentage
+        Dim ProgressPercentage As Double = 0
+        If Regex.Match(Line, "\d\d[%]+").Success Then
+            If Double.TryParse(Regex.Match(Line, "\d\d[%]+").Value.Replace("%", ""), ProgressPercentage) = True Then
+                InstallationProgressBar.Value = ProgressPercentage
             End If
-
-            'Progress percentage
-            Dim ProgressPercentage As Double = 0
-            If Regex.Match(e.Data, "\d\d[%]+").Success Then
-                If Double.TryParse(Regex.Match(e.Data, "\d\d[%]+").Value.Replace("%", ""), ProgressPercentage) = True Then
-                    If InstallationProgressBar.CheckAccess() = False Then
-                        InstallationProgressBar.Dispatcher.BeginInvoke(Sub() InstallationProgressBar.Value = ProgressPercentage)
-                    Else
-                        InstallationProgressBar.Value = ProgressPercentage
-                    End If
-                End If
-            End If
-
-        End If
-    End Sub
-
-    Private Sub HDL_Dump_Exited(sender As Object, e As EventArgs) Handles HDL_Dump.Exited
-        HDL_Dump.CancelOutputRead()
-        HDL_Dump.Dispose()
-
-        If InstallForPS2 Then
-            'Proceed to the creation of the game's PP partition
-            If InstallationStatusTextBlock.CheckAccess() = False Then
-                InstallationStatusTextBlock.Dispatcher.BeginInvoke(Sub() InstallationStatusTextBlock.Text = "Creating game PP partition ...")
-            Else
-                InstallationStatusTextBlock.Text = "Creating game PP partition ..."
-            End If
-            CreateGamePartition()
         End If
     End Sub
 

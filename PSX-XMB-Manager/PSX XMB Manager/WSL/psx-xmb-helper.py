@@ -669,11 +669,11 @@ def verb_connect(request):
                 raise HelperError("NBD_ALREADY_CONNECTED_OTHER_ENDPOINT",
                                   "Already connected to nbd://%s:%s. Disconnect first." % (status["ip"], status["port"]))
             raise HelperError("STALE_MOUNT_STATE",
-                              "An old NBD mount (%s) is still present. Use Recover WSL Connection first." % status["state"])
+                              "An old NBD mount (%s) is still present. Use Recover Connection first." % status["state"])
 
         # Not mounted: stale pid/state files may be removed.
         if status["pfs_mounts"]:
-            raise HelperError("STALE_MOUNT_STATE", "PFS partitions are still mounted from an old connection. Use Recover WSL Connection first.")
+            raise HelperError("STALE_MOUNT_STATE", "PFS partitions are still mounted from an old connection. Use Recover Connection first.")
         remove_file(PID_FILE)
         remove_file(CONNECTION_FILE)
         save_pfs_mount_records([])
