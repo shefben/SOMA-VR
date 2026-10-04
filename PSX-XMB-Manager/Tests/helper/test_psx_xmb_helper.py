@@ -10,6 +10,7 @@ The helper keeps its state under $HOME, so every test points HOME at a temporary
 import importlib.util
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -234,6 +235,21 @@ class MainTests(unittest.TestCase):
         self.call("hdl", {"args": ["rmpart", self.raw_path]})
         with open(os.path.join(self.state_dir, "helper.log"), encoding="utf-8") as handle:
             self.assertIn("hdl INVALID_REQUEST", handle.read())
+
+
+class InstallScriptTests(unittest.TestCase):
+    """WSL/install-wsl-backend.sh fills in bootstrap-wsl.sh by hand; it must replace every placeholder the app does."""
+
+    def test_manual_install_script_fills_every_bootstrap_placeholder(self):
+        wsl_dir = os.path.dirname(HELPER)
+        with open(os.path.join(wsl_dir, "bootstrap-wsl.sh")) as handle:
+            placeholders = set(re.findall(r"__PSX_XMB_[A-Z0-9_]+__", handle.read()))
+        with open(os.path.join(wsl_dir, "install-wsl-backend.sh"), newline="") as handle:
+            script = handle.read()
+        self.assertEqual({"__PSX_XMB_MODE__", "__PSX_XMB_HELPER_B64__", "__PSX_XMB_PROTOCOL_VERSION__"}, placeholders)
+        for placeholder in placeholders:
+            self.assertIn("s|%s|" % placeholder, script)
+        self.assertNotIn("\r", script)  # bash fails on Windows line endings
 
 
 if __name__ == "__main__":

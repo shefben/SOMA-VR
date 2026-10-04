@@ -328,10 +328,15 @@
     <EmbeddedResource Include="DIC.xshd" />
     <EmbeddedResource Include="WSL\bootstrap-wsl.sh">
       <LogicalName>PSX_XMB_Manager.WSL.bootstrap-wsl.sh</LogicalName>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </EmbeddedResource>
     <EmbeddedResource Include="WSL\psx-xmb-helper.py">
       <LogicalName>PSX_XMB_Manager.WSL.psx-xmb-helper.py</LogicalName>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </EmbeddedResource>
+    <None Include="WSL\install-wsl-backend.sh">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
     <None Include="My Project\app.manifest" />
     <None Include="My Project\Settings.settings">
       <Generator>SettingsSingleFileGenerator</Generator>

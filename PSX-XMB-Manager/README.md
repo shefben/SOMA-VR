@@ -57,6 +57,8 @@ Prerequisites:
 3. The OPL NBD server running on the PSX (default port **10809**)
 4. A network connection between the PC and the PSX
 
+**Step-by-step guide with every command: [WSL2-SETUP.md](WSL2-SETUP.md).**
+
 Setup is done inside the application: choose `WSL2 NBD` as connection method, select the distro and click **Install / Repair WSL Backend** (also in the menu as **WSL2 Setup**). It installs `libnbd-bin` (nbdfuse, nbdinfo), `fuse3`, `libfuse-dev`, `python3` and the build tools, builds the pinned `hdl_dump` and `pfsshell`/`pfsfuse` and installs the PSX XMB Manager helper. It asks before running and never runs on its own at startup.
 
 - Dokan is **not** required for the WSL2 network connection.
