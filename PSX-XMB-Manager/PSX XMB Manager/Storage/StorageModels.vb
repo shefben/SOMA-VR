@@ -626,9 +626,10 @@ Public NotInheritable Class WslOutputParsers
             Dim version As Integer
             If Not Integer.TryParse(columns(columns.Length - 1), version) Then Continue For
             If version < 1 OrElse version > 9 Then Continue For
+            ' Distribution names cannot contain spaces, but a translated state can ("En cours", "Wird ausgeführt").
             distros.Add(New WslDistroInfo With {
-                .Name = String.Join(" ", columns.Take(columns.Length - 2)),
-                .State = columns(columns.Length - 2),
+                .Name = columns(0),
+                .State = String.Join(" ", columns.Skip(1).Take(columns.Length - 2)),
                 .Version = version,
                 .IsDefault = isDefault
             })
