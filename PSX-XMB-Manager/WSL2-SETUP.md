@@ -95,6 +95,7 @@ What gets installed (same for A and B):
 | `fuse3`, `libfuse-dev` | Lets Linux and Windows open the disk and game partitions |
 | `hdl_dump` (built from ps2homebrew/hdl-dump, commit `32c296c`) | Lists, installs and edits games |
 | `pfsshell`, `pfsfuse` (built from ps2homebrew/pfsshell, commit `8c92467`) | Reads and writes PS2 partitions |
+| `meson` 1.3.2 (run from its source in `/opt/psx-xmb-manager-src`) | Builds pfsshell; Ubuntu 22.04's own meson cannot |
 | `psx-xmb-helper` | The small program PSX XMB Manager talks to inside Linux |
 | `user_allow_other` in `/etc/fuse.conf` | Lets Windows Explorer open a mounted game partition |
 
@@ -188,16 +189,18 @@ blocks one at a time.
    sudo install -m 0755 hdl_dump /usr/local/bin/hdl_dump
    ```
 
-3. pfsshell and pfsfuse:
+3. pfsshell and pfsfuse. They are built with meson 1.3.2 run from its source: the meson that Ubuntu 22.04
+   installs (0.61) stops with `Sandbox violation` on pfsshell.
 
    ```bash
    cd /opt/psx-xmb-manager-src
+   git clone --depth 1 --branch 1.3.2 https://github.com/mesonbuild/meson.git meson-1.3.2
    git clone --recursive https://github.com/ps2homebrew/pfsshell.git
    cd pfsshell
    git checkout 8c92467b3d715c3698f1f8ce63a8a07e214d6c73
    git submodule update --init --recursive
-   meson setup build -Denable_pfsfuse=true -Denable_pfs2tar=true
-   meson compile -C build
+   python3 ../meson-1.3.2/meson.py setup build -Denable_pfsfuse=true -Denable_pfs2tar=true
+   python3 ../meson-1.3.2/meson.py compile -C build
    sudo install -m 0755 build/pfsshell build/pfsfuse /usr/local/bin/
    ```
 

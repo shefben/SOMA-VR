@@ -251,6 +251,15 @@ class InstallScriptTests(unittest.TestCase):
             self.assertIn("s|%s|" % placeholder, script)
         self.assertNotIn("\r", script)  # bash fails on Windows line endings
 
+    def test_pfsshell_is_built_with_the_pinned_meson(self):
+        # The distribution's meson 0.59-0.61 (Ubuntu 22.04: 0.61.2) rejects pfsshell's symlinked subprojects.
+        with open(os.path.join(os.path.dirname(HELPER), "bootstrap-wsl.sh")) as handle:
+            bootstrap = handle.read()
+        self.assertIn('MESON_COMMIT="614d436232d3a86518164cbe2b8af12db3bde009"', bootstrap)
+        self.assertIn('python3 "$MESON_DIR/meson.py" setup build', bootstrap)
+        self.assertIn('python3 "$MESON_DIR/meson.py" compile -C build', bootstrap)
+        self.assertIsNone(re.search(r"^\s*meson (setup|compile)", bootstrap, re.MULTILINE))
+
 
 if __name__ == "__main__":
     unittest.main()

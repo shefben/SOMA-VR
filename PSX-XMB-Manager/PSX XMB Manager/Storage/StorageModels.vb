@@ -554,6 +554,39 @@ Public NotInheritable Class OutputText
     End Function
 End Class
 
+''' <summary>Turns the output of the WSL bootstrap into the few lines a setup error dialog shows.</summary>
+Public NotInheritable Class BootstrapReport
+    Public Const FailureMarker As String = "PSX_XMB_BOOTSTRAP_FAILED:"
+    Public Const SuccessMarker As String = "PSX_XMB_BOOTSTRAP_OK"
+
+    ''' <summary>
+    ''' The bootstrap's own failure line with the lines that led to it, or else the last lines of its output.
+    ''' stderr is listed after stdout, so a tool that writes progress to stderr (git) cannot hide the real error.
+    ''' </summary>
+    Public Shared Function Summarize(result As ProcessResult, Optional maxLines As Integer = 12) As String
+        Dim lines As List(Of String) = OutputText.SplitLines(result.StandardOutput).
+            Concat(OutputText.SplitLines(result.StandardError)).
+            Where(Function(l) l.Trim() <> "").ToList()
+        Dim failureIndex As Integer = lines.FindLastIndex(Function(l) l.StartsWith(FailureMarker, StringComparison.Ordinal))
+        Dim shown As IEnumerable(Of String)
+        If failureIndex >= 0 Then
+            Dim first As Integer = Math.Max(0, failureIndex - (maxLines - 1))
+            shown = lines.Skip(first).Take(failureIndex - first + 1)
+        Else
+            shown = lines.Skip(Math.Max(0, lines.Count - maxLines))
+        End If
+        Dim summary As String = String.Join(vbCrLf, shown)
+        If result.TimedOut Then
+            summary += vbCrLf + vbCrLf + "The setup was stopped because it ran longer than " + CInt(OperationTimeouts.Bootstrap.TotalMinutes).ToString() + " minutes."
+        ElseIf result.Cancelled Then
+            summary += vbCrLf + vbCrLf + "The setup was cancelled."
+        ElseIf failureIndex < 0 AndAlso result.ExitCode <> 0 Then
+            summary += vbCrLf + vbCrLf + "The setup ended with exit code " + result.ExitCode.ToString() + "."
+        End If
+        Return summary.Trim()
+    End Function
+End Class
+
 ''' <summary>One game line of "hdl_dump hdl_toc".</summary>
 Public Class HdlTocGame
     Public Property Type As String = ""

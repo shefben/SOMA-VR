@@ -113,5 +113,43 @@ Public Class EmbeddedScriptTests
         Assert.Equal("/usr/local/lib/psx-xmb-manager/psx-xmb-helper.py", WSLProcessRunner.HelperLinuxPath)
         Assert.DoesNotContain(vbCr, helper)
         Assert.DoesNotContain(vbCr, bootstrap)
+        ' Errors must reach stdout, which is what the setup dialog summarizes.
+        Assert.Contains("exec 2>&1", bootstrap)
+        Assert.Contains(BootstrapReport.FailureMarker, bootstrap)
+        Assert.Contains(BootstrapReport.SuccessMarker, bootstrap)
+    End Sub
+End Class
+
+Public Class BootstrapReportTests
+
+    <Fact>
+    Public Sub FailureLine_IsShownEvenWhenGitWroteToStderrLast()
+        ' What the first Windows run showed: git's checkout advice on stderr hid the error that was on stdout.
+        Dim result As New ProcessResult With {
+            .ExitCode = 1,
+            .StandardOutput = "==> Building pfsshell" & vbLf & "ERROR: something broke" & vbLf &
+                              BootstrapReport.FailureMarker & " ""meson setup build"" exited with code 1 (bootstrap line 140)." & vbLf,
+            .StandardError = "Note: switching to '8c92467'." & vbLf & "HEAD is now at 8c92467 Fix build failure" & vbLf
+        }
+        Dim summary As String = BootstrapReport.Summarize(result)
+        Assert.EndsWith("(bootstrap line 140).", summary)
+        Assert.Contains("ERROR: something broke", summary)
+        Assert.DoesNotContain("HEAD is now at", summary)
+    End Sub
+
+    <Fact>
+    Public Sub WithoutFailureLine_ShowsTheLastLinesAndTheExitCode()
+        Dim stdout As String = String.Join(vbLf, Enumerable.Range(1, 30).Select(Function(i) "line " & i.ToString()))
+        Dim summary As String = BootstrapReport.Summarize(New ProcessResult With {.ExitCode = 137, .StandardOutput = stdout}, 5)
+        Assert.StartsWith("line 26", summary)
+        Assert.Contains("line 30", summary)
+        Assert.EndsWith("exit code 137.", summary)
+        Assert.DoesNotContain("line 25" & vbCrLf, summary)
+    End Sub
+
+    <Fact>
+    Public Sub TimeoutAndCancel_AreNamed()
+        Assert.Contains("ran longer than 45 minutes", BootstrapReport.Summarize(New ProcessResult With {.ExitCode = -1, .TimedOut = True, .StandardOutput = "==> Building hdl_dump"}))
+        Assert.Contains("cancelled", BootstrapReport.Summarize(New ProcessResult With {.ExitCode = -1, .Cancelled = True}))
     End Sub
 End Class

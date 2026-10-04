@@ -15,7 +15,11 @@
 # the whole script before any command (apt, git, make) could consume the rest of it from stdin.
 
 main() {
-    set -euo pipefail
+    set -Eeuo pipefail
+    # One ordered stream: the application shows the last lines of stdout, so errors must not sit in a separate stderr.
+    exec 2>&1
+    # Name the command that stopped the setup instead of ending silently.
+    trap 'echo "PSX_XMB_BOOTSTRAP_FAILED: \"$BASH_COMMAND\" exited with code $? (bootstrap line $LINENO)."' ERR
 
     local MODE="__PSX_XMB_MODE__"
     local HELPER_B64="__PSX_XMB_HELPER_B64__"
@@ -24,6 +28,9 @@ main() {
     local HDL_DUMP_COMMIT="32c296c69cf9c263fcbe035004aa28c345b3b279"
     local PFSSHELL_REPO="https://github.com/ps2homebrew/pfsshell.git"
     local PFSSHELL_COMMIT="8c92467b3d715c3698f1f8ce63a8a07e214d6c73"
+    local MESON_REPO="https://github.com/mesonbuild/meson.git"
+    local MESON_TAG="1.3.2"
+    local MESON_COMMIT="614d436232d3a86518164cbe2b8af12db3bde009"
     local SRC_ROOT="/opt/psx-xmb-manager-src"
     local HELPER_DIR="/usr/local/lib/psx-xmb-manager"
     local HELPER_PATH="$HELPER_DIR/psx-xmb-helper.py"
@@ -31,7 +38,7 @@ main() {
     local PROTOCOL_VERSION_EXPECTED="__PSX_XMB_PROTOCOL_VERSION__"
 
     step() { echo "==> $*"; }
-    fail() { echo "PSX_XMB_BOOTSTRAP_FAILED: $*" >&2; exit 1; }
+    fail() { trap - ERR; echo "PSX_XMB_BOOTSTRAP_FAILED: $*"; exit 1; }
 
     [ "$(id -u)" = "0" ] || fail "the bootstrap must run as root (wsl.exe -u root)."
     case "$MODE" in
@@ -104,7 +111,7 @@ main() {
             git fetch --all --tags
             git reset --hard
             git clean -fdx
-            git checkout "$HDL_DUMP_COMMIT"
+            git -c advice.detachedHead=false checkout -q "$HDL_DUMP_COMMIT"
             make clean || true
             make RELEASE=no DEBUG=yes
             install -m 0755 hdl_dump /usr/local/bin/hdl_dump
@@ -125,13 +132,23 @@ main() {
             git fetch --all --tags
             git reset --hard
             git clean -fdx
-            git checkout "$PFSSHELL_COMMIT"
+            git -c advice.detachedHead=false checkout -q "$PFSSHELL_COMMIT"
             git submodule sync --recursive
             git submodule update --init --recursive
+            # pfsshell's subprojects reach into external/ps2sdk through symlinks. Meson 0.59 to 0.61 rejects that
+            # ("Sandbox violation: Tried to grab file ... outside current (sub)project"), and Ubuntu 22.04 ships
+            # meson 0.61.2. pfsshell is therefore configured with a pinned meson run from its source tree
+            # (meson.py needs only python3 and ninja), the release Ubuntu 24.04 ships, on every distribution.
+            local MESON_DIR="$SRC_ROOT/meson-$MESON_TAG"
+            if [ "$(git -C "$MESON_DIR" rev-parse HEAD 2>/dev/null)" != "$MESON_COMMIT" ]; then
+                step "Getting meson $MESON_TAG"
+                rm -rf "$MESON_DIR"
+                git -c advice.detachedHead=false clone -q --depth 1 --branch "$MESON_TAG" "$MESON_REPO" "$MESON_DIR"
+                [ "$(git -C "$MESON_DIR" rev-parse HEAD)" = "$MESON_COMMIT" ] || fail "meson tag $MESON_TAG is not commit $MESON_COMMIT."
+            fi
             rm -rf build
-            meson setup build -Denable_pfsfuse=true -Denable_pfs2tar=true
-            # 'meson compile' needs meson 0.54+; older releases (Ubuntu 20.04) build with ninja directly.
-            meson compile -C build || ninja -C build
+            python3 "$MESON_DIR/meson.py" setup build -Denable_pfsfuse=true -Denable_pfs2tar=true
+            python3 "$MESON_DIR/meson.py" compile -C build
             install -m 0755 build/pfsshell /usr/local/bin/pfsshell
             install -m 0755 build/pfsfuse /usr/local/bin/pfsfuse
             echo "$PFSSHELL_COMMIT" > "$PFS_STAMP"

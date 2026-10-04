@@ -689,7 +689,7 @@ Public Class NewMainWindow
         If fullSetup Then
             details = "The following will be installed as root inside the WSL2 distribution '" + distroName + "' (" + probe.DistroOsName + "):" + vbCrLf + vbCrLf +
                       "Packages (apt-get): ca-certificates, git, build-essential, pkg-config, meson, ninja-build, python3, libnbd-bin (nbdfuse, nbdinfo), fuse3, libfuse-dev" + vbCrLf + vbCrLf +
-                      "Built from pinned source: hdl_dump (ps2homebrew/hdl-dump 32c296c), pfsshell and pfsfuse (ps2homebrew/pfsshell 8c92467)" + vbCrLf + vbCrLf +
+                      "Built from pinned source: hdl_dump (ps2homebrew/hdl-dump 32c296c), pfsshell and pfsfuse (ps2homebrew/pfsshell 8c92467, built with meson 1.3.2 from source)" + vbCrLf + vbCrLf +
                       "PSX XMB Manager helper (protocol " + WSL2NBDBackend.ExpectedHelperProtocolVersion.ToString() + ") in /usr/local/lib/psx-xmb-manager" + vbCrLf + vbCrLf +
                       "/etc/fuse.conf: user_allow_other (lets Windows open mounted partitions)" + vbCrLf + vbCrLf +
                       "This downloads packages and source code and can take several minutes. Continue?"
@@ -704,11 +704,13 @@ Public Class NewMainWindow
         Dim transcript As String = ""
         Dim succeeded As Boolean = False
         Dim failure As Exception = Nothing
+        Dim setupResult As ProcessResult = Nothing
         Try
             Dim progress As Action(Of String) = Sub(line) Dispatcher.BeginInvoke(Sub() BackendActivityLabel.Text = line)
             Dim result As ProcessResult = Await wslBackend.InstallOrRepairAsync(fullSetup, progress, CancellationToken.None)
+            setupResult = result
             transcript = result.CombinedOutput
-            succeeded = result.Succeeded AndAlso result.StandardOutput.Contains("PSX_XMB_BOOTSTRAP_OK")
+            succeeded = result.Succeeded AndAlso result.StandardOutput.Contains(BootstrapReport.SuccessMarker)
         Catch ex As Exception
             failure = ex
             transcript = ex.ToString()
@@ -725,9 +727,16 @@ Public Class NewMainWindow
             ShowBackendError(failure, "Install / Repair WSL Backend")
         ElseIf succeeded AndAlso LastProbe IsNot Nothing AndAlso LastProbe.IsReady Then
             MsgBox("The WSL2 backend is installed and ready in '" + distroName + "'." + vbCrLf + "You can now connect to your PSX.", MsgBoxStyle.Information, "Install / Repair WSL Backend")
+        ElseIf succeeded Then
+            'The script finished, but the check run afterwards still finds something missing
+            Dim problem As String = If(LastProbe Is Nothing OrElse LastProbe.SetupMessage = "", "The backend check did not complete.", LastProbe.SetupMessage)
+            Dim nextStep As String = If(LastProbe Is Nothing OrElse LastProbe.SetupErrorCode = "", "", BackendErrorCodes.NextStep(LastProbe.SetupErrorCode))
+            MsgBox("The WSL2 backend setup finished, but the check afterwards still reports a problem:" + vbCrLf + vbCrLf + problem +
+                   If(nextStep = "", "", vbCrLf + vbCrLf + "What to do: " + nextStep) +
+                   If(LastProbe Is Nothing OrElse LastProbe.SetupErrorCode = "", "", vbCrLf + "Error code: " + LastProbe.SetupErrorCode) + vbCrLf + vbCrLf +
+                   If(logFile = "", "", "Full output: " + logFile), MsgBoxStyle.Exclamation, "Install / Repair WSL Backend")
         Else
-            Dim tail As String = String.Join(vbCrLf, OutputText.SplitLines(transcript).Where(Function(l) l.Trim() <> "").Reverse().Take(12).Reverse())
-            MsgBox("The WSL2 backend setup did not finish." + vbCrLf + vbCrLf + tail + vbCrLf + vbCrLf +
+            MsgBox("The WSL2 backend setup did not finish." + vbCrLf + vbCrLf + BootstrapReport.Summarize(setupResult) + vbCrLf + vbCrLf +
                    If(logFile = "", "", "Full output: " + logFile), MsgBoxStyle.Critical, "Install / Repair WSL Backend")
         End If
     End Function
