@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Unit tests for the storage backend layer. The application targets .NET Framework 4.8 with WPF; the files tested
+    here have no WPF dependency, so they are linked into a net8.0 test assembly that also runs on Linux and in CI.
+    Run with: dotnet test Tests/PSXXMBManager.Tests
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>PSX_XMB_Manager</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <OptionStrict>On</OptionStrict>
+    <OptionInfer>On</OptionInfer>
+    <OptionExplicit>On</OptionExplicit>
+    <OptionCompare>Binary</OptionCompare>
+    <MyType>Empty</MyType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Import Include="System" />
+    <Import Include="System.Collections" />
+    <Import Include="System.Collections.Generic" />
+    <Import Include="System.Diagnostics" />
+    <Import Include="System.Linq" />
+    <Import Include="System.Threading.Tasks" />
+    <Import Include="Microsoft.VisualBasic" />
+    <Import Include="System.Windows.Media" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\PSX XMB Manager\Classes\Structs.vb" Link="Linked\Structs.vb" />
+    <Compile Include="..\..\PSX XMB Manager\Storage\StorageBackendKind.vb" Link="Linked\StorageBackendKind.vb" />
+    <Compile Include="..\..\PSX XMB Manager\Storage\StorageModels.vb" Link="Linked\StorageModels.vb" />
+    <Compile Include="..\..\PSX XMB Manager\Storage\IPSXStorageBackend.vb" Link="Linked\IPSXStorageBackend.vb" />
+    <Compile Include="..\..\PSX XMB Manager\Storage\WSLProcessRunner.vb" Link="Linked\WSLProcessRunner.vb" />
+    <Compile Include="..\..\PSX XMB Manager\Storage\WSL2NBDBackend.vb" Link="Linked\WSL2NBDBackend.vb" />
+    <EmbeddedResource Include="..\..\PSX XMB Manager\WSL\bootstrap-wsl.sh" LogicalName="PSX_XMB_Manager.WSL.bootstrap-wsl.sh" Link="Linked\bootstrap-wsl.sh" />
+    <EmbeddedResource Include="..\..\PSX XMB Manager\WSL\psx-xmb-helper.py" LogicalName="PSX_XMB_Manager.WSL.psx-xmb-helper.py" Link="Linked\psx-xmb-helper.py" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+</Project>

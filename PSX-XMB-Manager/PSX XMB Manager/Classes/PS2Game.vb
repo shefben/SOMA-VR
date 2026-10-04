@@ -14,7 +14,6 @@
     Private _GameDeveloper As String
     Private _GameWebsite As String
     Private _GameCoverURL As String
-    Private _AssignedPartitionDriveLetter As String
     Private _PartitionName As String
 
     Public Property GameTitle As String
@@ -143,14 +142,8 @@
         End Set
     End Property
 
-    Public Property AssignedPartitionDriveLetter As String
-        Get
-            Return _AssignedPartitionDriveLetter
-        End Get
-        Set
-            _AssignedPartitionDriveLetter = Value
-        End Set
-    End Property
+    ''' <summary>The game's PP partition while it is mounted through the storage backend; Nothing when not mounted.</summary>
+    Public Property MountedPartition As PfsMountHandle
 
     Public Property PartitionName As String
         Get

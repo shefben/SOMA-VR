@@ -67,6 +67,9 @@ Public Class ComboBoxHDDDrive
         End Set
     End Property
 
+    ''' <summary>True for the PSX HDD connected through the WSL2 NBD backend (backed up and restored by Linux dd, not dd.exe).</summary>
+    Public Property IsConnectedPsx As Boolean
+
     Public Property ComboBoxDisplayText As String
         Get
             Return _ComboBoxDisplayText

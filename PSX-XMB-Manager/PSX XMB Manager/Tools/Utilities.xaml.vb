@@ -2,6 +2,7 @@
 Imports System.IO
 Imports System.Management
 Imports System.Runtime.InteropServices
+Imports System.Threading
 Imports System.Text
 Imports System.Windows.Interop
 Imports System.Windows.Threading
@@ -10,6 +11,7 @@ Imports PSX_XMB_Manager.Structs
 Public Class Utilities
 
     Public MountedDrive As MountedPSXDrive = Nothing
+    Public StorageBackend As IPSXStorageBackend
 
     Private WithEvents BChunk As New Process()
     Private WithEvents BIOSUnpacker As New Process()
@@ -19,19 +21,60 @@ Public Class Utilities
     Private WithEvents PAKer As New Process()
     Private WithEvents PSXDec As New Process()
     Private WithEvents STARGazer As New Process()
-    Private WithEvents HDL_Dump As New Process()
 
     Dim ListOfFoundDrives As New List(Of ComboBoxHDDDrive)()
 
     Private NewBaseName As String = ""
 
-    Private Sub Utilities_Loaded(sender As Object, e As RoutedEventArgs) Handles Me.Loaded
+    'Backup & restore of the PSX connected through WSL2
+    Private ConnectedPsxSize As Long = 0
+    Private RawCopyRunning As Boolean = False
+    Private RawCopyIsRestore As Boolean = False
+    Private RawCopyCancellation As CancellationTokenSource
+
+    Private Async Sub Utilities_Loaded(sender As Object, e As RoutedEventArgs) Handles Me.Loaded
+        GetHDDrives()
+
+        'List the connected PSX as backup & restore target once its size is known
+        Await RefreshConnectedPsxSizeAsync()
         GetHDDrives()
     End Sub
 
     Private Sub Utilities_Closing(sender As Object, e As CancelEventArgs) Handles Me.Closing
+        If RawCopyRunning Then
+            e.Cancel = True
+            If RawCopyIsRestore Then
+                MsgBox("The restore of the PSX HDD is running and cannot be interrupted. Please wait until it is finished.", MsgBoxStyle.Exclamation, "Restore running")
+            ElseIf MsgBox("A backup of the PSX HDD is running. Do you want to cancel it ?", MsgBoxStyle.YesNo, "Backup running") = MsgBoxResult.Yes Then
+                RawCopyCancellation?.Cancel()
+            End If
+            Return
+        End If
+
         UnregisterNotification()
     End Sub
+
+    Private Shared Sub ShowError(ex As Exception, title As String)
+        Dim backendError As StorageBackendException = TryCast(ex, StorageBackendException)
+        MsgBox(If(backendError IsNot Nothing, BackendErrorCodes.FormatForUser(backendError), ex.Message), MsgBoxStyle.Critical, title)
+    End Sub
+
+    Private ReadOnly Property IsWslPsxConnected As Boolean
+        Get
+            Return StorageBackend IsNot Nothing AndAlso StorageBackend.Kind = StorageBackendKind.WSL2NBD AndAlso StorageBackend.IsConnected
+        End Get
+    End Property
+
+    Private Async Function RefreshConnectedPsxSizeAsync() As Task
+        ConnectedPsxSize = 0
+        If Not IsWslPsxConnected Then Return
+        Try
+            ConnectedPsxSize = Await StorageBackend.GetRawDeviceSizeAsync(CancellationToken.None)
+        Catch ex As Exception
+            'Not listed then; the main window shows the connection problem
+            BackendLog.Write(StorageBackendKind.WSL2NBD, "", "raw-size", "Utilities: " + ex.Message, -1, TimeSpan.Zero, "", "", "")
+        End Try
+    End Function
 
 #Region "HDD Utils"
 
@@ -147,6 +190,16 @@ Public Class Utilities
             End If
         Next
 
+        'The PSX connected through WSL2 is not a Windows physical drive, so it is listed as its own target
+        If IsWslPsxConnected AndAlso ConnectedPsxSize > 0 Then
+            ListOfFoundDrives.Add(New ComboBoxHDDDrive() With {
+                .IsConnectedPsx = True,
+                .DeviceCaption = "Connected PSX via WSL2",
+                .DevicePath = StorageBackend.MountedDrive.NativeDevicePath,
+                .DeviceSize = CULng(ConnectedPsxSize),
+                .ComboBoxDisplayText = "Connected PSX via WSL2 — " + StorageBackend.MountedDrive.ConnectedOnIP + " — " + StorageValidation.FormatSize(ConnectedPsxSize)})
+        End If
+
         ConnectedDrivesComboBox.ItemsSource = ListOfFoundDrives
         ConnectedDrivesComboBox.DisplayMemberPath = "ComboBoxDisplayText"
         ConnectedDrivesComboBox2.ItemsSource = ListOfFoundDrives
@@ -160,11 +213,16 @@ Public Class Utilities
         End If
     End Sub
 
-    Private Sub StartBackupButton_Click(sender As Object, e As RoutedEventArgs) Handles StartBackupButton.Click
+    Private Async Sub StartBackupButton_Click(sender As Object, e As RoutedEventArgs) Handles StartBackupButton.Click
         If ConnectedDrivesComboBox.SelectedItem IsNot Nothing AndAlso Not String.IsNullOrEmpty(BackupSavePathTextBox.Text) Then
             Dim SavePath As String = BackupSavePathTextBox.Text
             Dim SelectedHDD As ComboBoxHDDDrive = CType(ConnectedDrivesComboBox.SelectedItem, ComboBoxHDDDrive)
             Dim HDDPath As String = SelectedHDD.DevicePath
+
+            If SelectedHDD.IsConnectedPsx Then
+                Await RunConnectedPsxBackupAsync(SelectedHDD, SavePath)
+                Return
+            End If
 
             If MsgBox($"Do you really want to create a backup of {SelectedHDD.ComboBoxDisplayText} ?" & vbCrLf &
                       "This process will take some hours and start in a separate window so you can continue working with PSX XMB Manager.",
@@ -201,12 +259,17 @@ Public Class Utilities
         End If
     End Sub
 
-    Private Sub StartRestoreButton_Click(sender As Object, e As RoutedEventArgs) Handles StartRestoreButton.Click
+    Private Async Sub StartRestoreButton_Click(sender As Object, e As RoutedEventArgs) Handles StartRestoreButton.Click
         If ConnectedDrivesComboBox2.SelectedItem IsNot Nothing AndAlso Not String.IsNullOrEmpty(BackupRestorePathTextBox.Text) Then
             Try
                 Dim RestorePath As String = BackupRestorePathTextBox.Text
                 Dim SelectedHDD As ComboBoxHDDDrive = CType(ConnectedDrivesComboBox2.SelectedItem, ComboBoxHDDDrive)
                 Dim HDDPath As String = SelectedHDD.DevicePath
+
+                If SelectedHDD.IsConnectedPsx Then
+                    Await RunConnectedPsxRestoreAsync(RestorePath)
+                    Return
+                End If
 
                 If MsgBox($"Do you really want to restore the selected backup '{Path.GetFileName(BackupRestorePathTextBox.Text)}' to {SelectedHDD.ComboBoxDisplayText} ?" & vbCrLf &
                           "This process will delete all data on the HDD and takes some hours to complete." & vbCrLf &
@@ -240,77 +303,188 @@ Public Class Utilities
         End Try
     End Sub
 
-    Private Sub InstallPOPStarterButton_Click(sender As Object, e As RoutedEventArgs) Handles InstallPOPStarterButton.Click
-        If String.IsNullOrEmpty(MountedDrive.DriveID) Then
+    Private Function SelectedBlockSize() As String
+        Return If(IncreaseBlockSizeCheckBox.IsChecked, "4M", "1M")
+    End Function
+
+    Private Sub SetRawCopyRunning(Running As Boolean, IsRestore As Boolean)
+        RawCopyRunning = Running
+        RawCopyIsRestore = IsRestore
+        StartBackupButton.IsEnabled = Not Running
+        StartRestoreButton.IsEnabled = Not Running
+        IncreaseBlockSizeCheckBox.IsEnabled = Not Running
+        InstallPOPStarterButton.IsEnabled = Not Running
+        CancelRawCopyButton.IsEnabled = Running AndAlso Not IsRestore
+        Cursor = If(Running, Cursors.AppStarting, Cursors.Arrow)
+    End Sub
+
+    Private Sub CancelRawCopyButton_Click(sender As Object, e As RoutedEventArgs) Handles CancelRawCopyButton.Click
+        If RawCopyRunning AndAlso Not RawCopyIsRestore Then
+            CancelRawCopyButton.IsEnabled = False
+            RawCopyProgressTextBlock.Text = "Cancelling the backup..."
+            RawCopyCancellation?.Cancel()
+        End If
+    End Sub
+
+    ''' <summary>Backs the PSX connected through WSL2 up with Linux dd into a Windows file.</summary>
+    Private Async Function RunConnectedPsxBackupAsync(SelectedHDD As ComboBoxHDDDrive, SavePath As String) As Task
+        If Not IsWslPsxConnected Then
+            MsgBox("The PSX is not connected through WSL2 anymore. Please connect it again.", MsgBoxStyle.Exclamation, "Start Backup")
+            Return
+        End If
+
+        If MsgBox($"Do you really want to create a backup of {SelectedHDD.ComboBoxDisplayText} ?" & vbCrLf & vbCrLf &
+                  $"Destination: {SavePath}" & vbCrLf & vbCrLf &
+                  "The backup runs with dd inside WSL and can take some hours. The progress is shown in this window and the backup can be cancelled; a cancelled backup file is incomplete.",
+                  MsgBoxStyle.YesNo,
+                  "Start Backup") <> MsgBoxResult.Yes Then Return
+
+        RawCopyCancellation = New CancellationTokenSource()
+        SetRawCopyRunning(True, False)
+        RawCopyProgressTextBlock.Text = "Starting the backup..."
+        Dim BackupProgress As New Progress(Of String)(Sub(Line) If Not String.IsNullOrWhiteSpace(Line) Then RawCopyProgressTextBlock.Text = Line.Trim())
+
+        Try
+            Dim Result As ProcessResult = Await StorageBackend.BackupRawDeviceAsync(SavePath, SelectedBlockSize(), BackupProgress, RawCopyCancellation.Token)
+
+            If Result.Cancelled OrElse Result.ErrorCode = BackendErrorCodes.OperationCancelled Then
+                RawCopyProgressTextBlock.Text = "Backup cancelled."
+                MsgBox("The backup was cancelled. The file " + SavePath + " is incomplete and cannot be used for a restore.", MsgBoxStyle.Exclamation, "Backup cancelled")
+            ElseIf Result.Succeeded Then
+                RawCopyProgressTextBlock.Text = "Backup done."
+                MsgBox("Backup completed with success!" & vbCrLf & SavePath, MsgBoxStyle.Information, "Backup done")
+            Else
+                RawCopyProgressTextBlock.Text = "Backup failed."
+                MsgBox("The backup failed. The file " + SavePath + " may be incomplete." & vbCrLf & vbCrLf & Result.CombinedOutput.Trim().Replace(vbLf, vbCrLf), MsgBoxStyle.Critical, "Backup failed")
+            End If
+        Catch ex As Exception
+            RawCopyProgressTextBlock.Text = "Backup failed."
+            ShowError(ex, "Backup failed")
+        Finally
+            SetRawCopyRunning(False, False)
+            RawCopyCancellation.Dispose()
+            RawCopyCancellation = Nothing
+        End Try
+    End Function
+
+    ''' <summary>Overwrites the PSX connected through WSL2 with a backup file. The sizes must match exactly.</summary>
+    Private Async Function RunConnectedPsxRestoreAsync(RestorePath As String) As Task
+        If Not IsWslPsxConnected Then
+            MsgBox("The PSX is not connected through WSL2 anymore. Please connect it again.", MsgBoxStyle.Exclamation, "Restore Backup")
+            Return
+        End If
+
+        If Not File.Exists(RestorePath) Then
+            MsgBox("The backup file " + RestorePath + " does not exist.", MsgBoxStyle.Exclamation, "Restore Backup")
+            Return
+        End If
+
+        Dim SourceSize As Long = New FileInfo(RestorePath).Length
+        Dim TargetSize As Long
+        Try
+            TargetSize = Await StorageBackend.GetRawDeviceSizeAsync(CancellationToken.None)
+        Catch ex As Exception
+            ShowError(ex, "Restore Backup")
+            Return
+        End Try
+
+        'A backup of another HDD size is never written
+        If Not StorageValidation.IsExactSizeMatch(SourceSize, TargetSize) Then
+            MsgBox("The backup cannot be restored because its size does not match the connected PSX HDD." & vbCrLf & vbCrLf &
+                   $"Backup file: {RestorePath}" & vbCrLf &
+                   $"Backup size: {StorageValidation.FormatSize(SourceSize)} ({SourceSize:N0} bytes)" & vbCrLf &
+                   $"PSX HDD size: {StorageValidation.FormatSize(TargetSize)} ({TargetSize:N0} bytes)",
+                   MsgBoxStyle.Critical, "Size mismatch")
+            Return
+        End If
+
+        If MsgBox("WARNING: This will overwrite ALL data on the PSX HDD." & vbCrLf & vbCrLf &
+                  $"Source file: {RestorePath}" & vbCrLf &
+                  $"Source size: {StorageValidation.FormatSize(SourceSize)} ({SourceSize:N0} bytes)" & vbCrLf &
+                  $"PSX IP: {StorageBackend.MountedDrive.ConnectedOnIP}" & vbCrLf &
+                  $"Target size: {StorageValidation.FormatSize(TargetSize)} ({TargetSize:N0} bytes)" & vbCrLf & vbCrLf &
+                  "The restore runs with dd inside WSL, can take some hours and cannot be cancelled once it has started." & vbCrLf &
+                  "Do you really want to restore this backup ?",
+                  MsgBoxStyle.YesNo Or MsgBoxStyle.Exclamation Or MsgBoxStyle.DefaultButton2,
+                  "Restore Backup") <> MsgBoxResult.Yes Then Return
+
+        SetRawCopyRunning(True, True)
+        RawCopyProgressTextBlock.Text = "Starting the restore..."
+        Dim RestoreProgress As New Progress(Of String)(Sub(Line) If Not String.IsNullOrWhiteSpace(Line) Then RawCopyProgressTextBlock.Text = Line.Trim())
+
+        Try
+            Dim Result As ProcessResult = Await StorageBackend.RestoreRawDeviceAsync(RestorePath, SelectedBlockSize(), RestoreProgress, CancellationToken.None)
+
+            If Not Result.Succeeded Then
+                RawCopyProgressTextBlock.Text = "Restore failed."
+                MsgBox("The restore failed. The PSX HDD may now be in an inconsistent state." & vbCrLf & vbCrLf & Result.CombinedOutput.Trim().Replace(vbLf, vbCrLf), MsgBoxStyle.Critical, "Restore failed")
+                Return
+            End If
+
+            'Read the partition table again to check the restored HDD
+            RawCopyProgressTextBlock.Text = "Restore written, checking the partition table..."
+            Dim TocResult As ProcessResult = Await StorageBackend.RunHdlDumpAsync({"toc", StorageBackend.MountedDrive.HDLDriveName}, Nothing, CancellationToken.None)
+            If TocResult.Succeeded Then
+                RawCopyProgressTextBlock.Text = "Restore done."
+                MsgBox("Restore completed with success! The partition table of the PSX HDD was read successfully.", MsgBoxStyle.Information, "Restore done")
+            Else
+                RawCopyProgressTextBlock.Text = "Restore written, partition table check failed."
+                MsgBox("The backup was written, but the partition table of the PSX HDD could not be read afterwards." & vbCrLf & vbCrLf & TocResult.CombinedOutput.Trim().Replace(vbLf, vbCrLf), MsgBoxStyle.Exclamation, "Restore check failed")
+            End If
+            Utils.ReloadPartitions()
+        Catch ex As Exception
+            RawCopyProgressTextBlock.Text = "Restore failed."
+            ShowError(ex, "Restore failed")
+        Finally
+            SetRawCopyRunning(False, True)
+        End Try
+    End Function
+
+    Private Async Sub InstallPOPStarterButton_Click(sender As Object, e As RoutedEventArgs) Handles InstallPOPStarterButton.Click
+        If StorageBackend Is Nothing OrElse Not StorageBackend.IsConnected OrElse String.IsNullOrEmpty(StorageBackend.MountedDrive.DriveID) Then
             MsgBox("No HDD connected, installation will be aborted.", MsgBoxStyle.Critical, "Error while trying to install")
         Else
-            If MsgBox($"Please confirm to install POPStarter on your PSX HDD connected on {MountedDrive.ConnectedOnIP}" & vbCrLf, MsgBoxStyle.OkCancel, "Start installation") = MsgBoxResult.Ok Then
-                Task.Run(Sub()
-                             Dispatcher.BeginInvoke(Sub()
-                                                        POPSInstallProgressTextBox.AppendText("Preparing PFS commands" & vbCrLf)
-                                                        Cursor = Cursors.Wait
-                                                    End Sub)
+            If MsgBox($"Please confirm to install POPStarter on your PSX HDD connected on {StorageBackend.MountedDrive.ConnectedOnIP}" & vbCrLf, MsgBoxStyle.OkCancel, "Start installation") = MsgBoxResult.Ok Then
+                InstallPOPStarterButton.IsEnabled = False
+                Cursor = Cursors.Wait
+                POPSInstallProgressTextBox.AppendText("Preparing PFS commands" & vbCrLf)
 
-                             'Set the mkdir & put commands
-                             Using CommandFileWriter As New StreamWriter(AppDomain.CurrentDomain.BaseDirectory + "Tools\cmdlist\push.txt", False)
-                                 CommandFileWriter.WriteLine("device " + MountedDrive.DriveID)
-                                 CommandFileWriter.WriteLine("mount __common")
-                                 CommandFileWriter.WriteLine("mkdir POPS")
-                                 CommandFileWriter.WriteLine("cd POPS")
-                                 CommandFileWriter.WriteLine("put IOPRP252.IMG")
-                                 CommandFileWriter.WriteLine("put POPS.ELF")
-                                 CommandFileWriter.WriteLine("put POPSTARTER.ELF")
-                                 CommandFileWriter.WriteLine("umount")
-                                 CommandFileWriter.WriteLine("exit")
-                             End Using
+                'mkdir & put commands, sent straight to pfsshell; the files are put from the Tools directory
+                Dim Commands As New List(Of String) From {
+                    "device " + StorageBackend.MountedDrive.DriveID,
+                    "mount __common",
+                    "mkdir POPS",
+                    "cd POPS",
+                    "put IOPRP252.IMG",
+                    "put POPS.ELF",
+                    "put POPSTARTER.ELF",
+                    "umount",
+                    "exit"
+                }
 
-                             Dispatcher.BeginInvoke(Sub()
-                                                        POPSInstallProgressTextBox.AppendText("PFS commands saved" & vbCrLf)
-                                                        POPSInstallProgressTextBox.AppendText("Switching to Tools directory" & vbCrLf)
-                                                    End Sub)
+                POPSInstallProgressTextBox.AppendText("Starting installation using pfsshell..." & vbCrLf)
+                POPSInstallProgressTextBox.ScrollToEnd()
 
-                             'Switch to Tools directory
-                             Directory.SetCurrentDirectory(AppDomain.CurrentDomain.BaseDirectory + "Tools")
+                Try
+                    Dim Result As ProcessResult = Await StorageBackend.RunPfsShellAsync(Commands, Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Tools"), CancellationToken.None)
+                    Dim PFSShellOutput As String = Result.CombinedOutput
 
-                             Dispatcher.BeginInvoke(Sub()
-                                                        POPSInstallProgressTextBox.AppendText("Starting installation using pfsshell..." & vbCrLf)
-                                                        POPSInstallProgressTextBox.ScrollToEnd()
-                                                    End Sub)
-
-                             'Put required files to the partition using pfsshell
-                             Dim PFSShellOutput As String
-                             Using PFSShellProcess As New Process()
-                                 PFSShellProcess.StartInfo.FileName = "cmd"
-                                 PFSShellProcess.StartInfo.Arguments = """/c type """ + AppDomain.CurrentDomain.BaseDirectory + "Tools\cmdlist\push.txt"" | """ + AppDomain.CurrentDomain.BaseDirectory + "Tools\pfsshell.exe"" 2>&1"
-                                 PFSShellProcess.StartInfo.RedirectStandardOutput = True
-                                 PFSShellProcess.StartInfo.UseShellExecute = False
-                                 PFSShellProcess.StartInfo.CreateNoWindow = True
-
-                                 PFSShellProcess.Start()
-                                 PFSShellProcess.WaitForExit()
-
-                                 Dim PFSShellReader As StreamReader = PFSShellProcess.StandardOutput
-                                 Dim ProcessOutput As String = PFSShellReader.ReadToEnd()
-
-                                 PFSShellReader.Close()
-                                 PFSShellOutput = ProcessOutput
-                             End Using
-
-                             Dispatcher.BeginInvoke(Sub()
-                                                        POPSInstallProgressTextBox.AppendText("Installation done!" & vbCrLf)
-                                                        POPSInstallProgressTextBox.ScrollToEnd()
-                                                    End Sub)
-
-                             'Set the current directory back
-                             Directory.SetCurrentDirectory(AppDomain.CurrentDomain.BaseDirectory)
-
-                             Dispatcher.BeginInvoke(Sub()
-                                                        POPSInstallProgressTextBox.AppendText("Switched back to PSX XMB Manager directory" & vbCrLf)
-                                                        POPSInstallProgressTextBox.ScrollToEnd()
-                                                        Cursor = Cursors.Arrow
-                                                        MsgBox("Installation completed with success!", MsgBoxStyle.OkOnly, "Success")
-                                                    End Sub)
-                         End Sub)
+                    If Result.TimedOut OrElse Result.Cancelled OrElse Result.ExitCode <> 0 OrElse PFSShellOutput.Contains("No such file or directory") Then
+                        POPSInstallProgressTextBox.AppendText("Installation failed:" & vbCrLf & PFSShellOutput.Trim().Replace(vbLf, vbCrLf) & vbCrLf)
+                        POPSInstallProgressTextBox.ScrollToEnd()
+                        MsgBox("There was an error while installing POPStarter, please check the installation log.", MsgBoxStyle.Exclamation, "Error while trying to install")
+                    Else
+                        POPSInstallProgressTextBox.AppendText("Installation done!" & vbCrLf)
+                        POPSInstallProgressTextBox.ScrollToEnd()
+                        MsgBox("Installation completed with success!", MsgBoxStyle.OkOnly, "Success")
+                    End If
+                Catch ex As Exception
+                    POPSInstallProgressTextBox.AppendText("Installation failed: " & ex.Message & vbCrLf)
+                    ShowError(ex, "Error while trying to install")
+                Finally
+                    Cursor = Cursors.Arrow
+                    InstallPOPStarterButton.IsEnabled = Not RawCopyRunning
+                End Try
             End If
         End If
     End Sub

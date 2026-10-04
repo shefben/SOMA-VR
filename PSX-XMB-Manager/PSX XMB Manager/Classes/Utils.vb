@@ -22,40 +22,6 @@ Public Class Utils
         End If
     End Function
 
-    Public Shared Function IsNBDConnected(WNBDClientPath As String) As String
-        Dim ProcessOutput As String()
-        Dim NBDDriveName As String = ""
-
-        'List connected clients
-        If Not String.IsNullOrEmpty(WNBDClientPath) Then
-            Using WNBDClient As New Process()
-                WNBDClient.StartInfo.FileName = WNBDClientPath
-                WNBDClient.StartInfo.Arguments = "list"
-                WNBDClient.StartInfo.RedirectStandardOutput = True
-                WNBDClient.StartInfo.UseShellExecute = False
-                WNBDClient.StartInfo.CreateNoWindow = True
-                WNBDClient.Start()
-                WNBDClient.WaitForExit()
-
-                Dim OutputReader As StreamReader = WNBDClient.StandardOutput
-                ProcessOutput = OutputReader.ReadToEnd().Split({vbCrLf}, StringSplitOptions.None)
-            End Using
-
-            For Each ReturnedLine As String In ProcessOutput
-                If ReturnedLine.Contains("wnbd-client") Then
-                    NBDDriveName = ReturnedLine.Split(New String() {" "}, StringSplitOptions.RemoveEmptyEntries)(4).Trim()
-                    Exit For
-                End If
-            Next
-        End If
-
-        If Not String.IsNullOrEmpty(NBDDriveName) Then
-            Return NBDDriveName
-        Else
-            Return ""
-        End If
-    End Function
-
     Public Shared Function IsLocalHDDConnected() As String
         'Query the drives
         If File.Exists(My.Computer.FileSystem.CurrentDirectory + "\Tools\hdl_dump.exe") Then
@@ -99,76 +65,11 @@ Public Class Utils
         End If
     End Function
 
-    Public Shared Function GetConnectedNBDIP(WNBDClientPath As String, NBDDriveName As String) As String
-        'Get the connected IP address
-        If Not String.IsNullOrEmpty(WNBDClientPath) Then
-            Dim ProcessOutput As String()
-            Dim NBDIP As String = ""
-
-            Using WNBDClient As New Process()
-                WNBDClient.StartInfo.FileName = WNBDClientPath
-                WNBDClient.StartInfo.Arguments = "show " + NBDDriveName
-                WNBDClient.StartInfo.RedirectStandardOutput = True
-                WNBDClient.StartInfo.UseShellExecute = False
-                WNBDClient.StartInfo.CreateNoWindow = True
-                WNBDClient.Start()
-                WNBDClient.WaitForExit()
-
-                Dim OutputReader As StreamReader = WNBDClient.StandardOutput
-                ProcessOutput = OutputReader.ReadToEnd().Split({vbCrLf}, StringSplitOptions.None)
-            End Using
-
-            For Each ReturnedLine As String In ProcessOutput
-                If ReturnedLine.Contains("Hostname") Then
-                    NBDIP = ReturnedLine.Split(":"c)(1).Trim()
-                    Exit For
-                End If
-            Next
-
-            Return NBDIP
-        Else
-            Return ""
-        End If
-    End Function
-
-    Public Shared Function GetHDLDriveName() As String
-        If File.Exists(My.Computer.FileSystem.CurrentDirectory + "\Tools\hdl_dump.exe") Then
-            Dim HDLDriveName As String = ""
-
-            'Query the drives
-            Using HDLDump As New Process()
-                HDLDump.StartInfo.FileName = My.Computer.FileSystem.CurrentDirectory + "\Tools\hdl_dump.exe"
-                HDLDump.StartInfo.Arguments = "query"
-                HDLDump.StartInfo.RedirectStandardOutput = True
-                HDLDump.StartInfo.UseShellExecute = False
-                HDLDump.StartInfo.CreateNoWindow = True
-                HDLDump.Start()
-                HDLDump.WaitForExit()
-
-                'Read the output
-                Dim OutputReader As StreamReader = HDLDump.StandardOutput
-                Dim ProcessOutput As String() = OutputReader.ReadToEnd().Split({vbCrLf}, StringSplitOptions.None)
-
-                'Find the drive
-                For Each Line As String In ProcessOutput
-                    If Not String.IsNullOrWhiteSpace(Line) Then
-                        If Line.Contains("formatted Playstation 2 HDD") Then
-                            'Set the found drive as mounted PSX drive
-                            Dim DriveInfos As String() = Line.Split(New String() {" "}, StringSplitOptions.RemoveEmptyEntries)
-                            HDLDriveName = DriveInfos(0).Trim()
-                            Exit For
-                        End If
-                    End If
-                Next
-            End Using
-
-            Return HDLDriveName
-        Else
-            Return ""
-        End If
-    End Function
-
-    Public Shared Function GetHDDID() As String
+    ''' <summary>
+    ''' Device path of a locally attached PS2/PSX HDD for the Windows tools (local-HDD backend only).
+    ''' Returns "WMIC_INSTALL_REQUIRED" when wmic is missing.
+    ''' </summary>
+    Public Shared Function GetLocalHDDDevicePath() As String
         Dim DriveID As String = ""
 
         'Query the drives
@@ -178,7 +79,11 @@ Public Class Utils
             WMIC.StartInfo.RedirectStandardOutput = True
             WMIC.StartInfo.UseShellExecute = False
             WMIC.StartInfo.CreateNoWindow = True
-            WMIC.Start()
+            Try
+                WMIC.Start()
+            Catch ex As ComponentModel.Win32Exception 'Windows 11 removed wmic, prompt for installation before continuing
+                Return "WMIC_INSTALL_REQUIRED"
+            End Try
             WMIC.WaitForExit()
 
             'Read the output
@@ -188,10 +93,7 @@ Public Class Utils
             'Find the drive
             For Each Line As String In ProcessOutput
                 If Not String.IsNullOrWhiteSpace(Line) Then
-                    If Line.Contains("WNBD WNBD_DISK SCSI Disk Device") Then
-                        DriveID = Line.Split(New String() {" "}, StringSplitOptions.RemoveEmptyEntries)(5).Trim()
-                        Exit For
-                    ElseIf Line.Contains("Microsoft Virtual Disk") Then 'For testing with local VHD
+                    If Line.Contains("Microsoft Virtual Disk") Then 'For testing with local VHD
                         DriveID = Line.Split(New String() {" "}, StringSplitOptions.RemoveEmptyEntries)(3).Trim()
                         Exit For
                     ElseIf Line.Contains("is not recognized") Then 'Windows 11 removed wmic, prompt for installation before continuing
@@ -333,14 +235,5 @@ Public Class Utils
             Throw New ApplicationException("No drive letter available.")
         End If
     End Function
-
-    Public Shared Sub RemoveMountedDriveLetter(DriveLetter As String)
-        For Each Win In Windows.Application.Current.Windows()
-            If Win.ToString = "PSX_XMB_Manager.GameLibrary" Then
-                CType(Win, GameLibrary).RemoveDriveLetterFromGame(DriveLetter)
-                Exit For
-            End If
-        Next
-    End Sub
 
 End Class

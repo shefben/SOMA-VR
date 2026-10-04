@@ -53,6 +53,66 @@ Namespace My
                 Return defaultInstance
             End Get
         End Property
+
+        <Global.System.Configuration.UserScopedSettingAttribute(),  _
+         Global.System.Diagnostics.DebuggerNonUserCodeAttribute(),  _
+         Global.System.Configuration.DefaultSettingValueAttribute("WSL2NBD")>  _
+        Public Property StorageBackend() As String
+            Get
+                Return CType(Me("StorageBackend"),String)
+            End Get
+            Set
+                Me("StorageBackend") = value
+            End Set
+        End Property
+
+        <Global.System.Configuration.UserScopedSettingAttribute(),  _
+         Global.System.Diagnostics.DebuggerNonUserCodeAttribute(),  _
+         Global.System.Configuration.DefaultSettingValueAttribute("")>  _
+        Public Property SelectedWslDistro() As String
+            Get
+                Return CType(Me("SelectedWslDistro"),String)
+            End Get
+            Set
+                Me("SelectedWslDistro") = value
+            End Set
+        End Property
+
+        <Global.System.Configuration.UserScopedSettingAttribute(),  _
+         Global.System.Diagnostics.DebuggerNonUserCodeAttribute(),  _
+         Global.System.Configuration.DefaultSettingValueAttribute("10809")>  _
+        Public Property NbdPort() As Integer
+            Get
+                Return CType(Me("NbdPort"),Integer)
+            End Get
+            Set
+                Me("NbdPort") = value
+            End Set
+        End Property
+
+        <Global.System.Configuration.UserScopedSettingAttribute(),  _
+         Global.System.Diagnostics.DebuggerNonUserCodeAttribute(),  _
+         Global.System.Configuration.DefaultSettingValueAttribute("")>  _
+        Public Property LastPsxIp() As String
+            Get
+                Return CType(Me("LastPsxIp"),String)
+            End Get
+            Set
+                Me("LastPsxIp") = value
+            End Set
+        End Property
+
+        <Global.System.Configuration.UserScopedSettingAttribute(),  _
+         Global.System.Diagnostics.DebuggerNonUserCodeAttribute(),  _
+         Global.System.Configuration.DefaultSettingValueAttribute("0")>  _
+        Public Property WslHelperProtocolVersion() As Integer
+            Get
+                Return CType(Me("WslHelperProtocolVersion"),Integer)
+            End Get
+            Set
+                Me("WslHelperProtocolVersion") = value
+            End Set
+        End Property
     End Class
 End Namespace
 

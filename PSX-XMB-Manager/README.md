@@ -46,8 +46,36 @@ The installed game or homebrew will show up on the XMB where you can start it li
 - It is not recommended to abort an installation within the first 3%, this could corrupt your HDD. The same goes for the last percentages of the installation.
 - Only connect your PSX's HDD locally if you know how to and never initialize it on Windows !
 
-## Required Drivers
-- [https://github.com/SvenGDK/PSX-XMB-Manager/wiki/Required-Drivers](https://github.com/SvenGDK/PSX-XMB-Manager/wiki/Required-Drivers)
+## WSL2 NBD Backend Requirements
+The PSX HDD is reached over the network through WSL2. The Windows NBD driver (Ceph for Windows / WNBD) is **no longer required** and is not used anymore.
+
+How it works: the Open PS2 Loader NBD server on the PSX is opened inside WSL2 by `nbdfuse`, which exposes the HDD as a raw file. The Linux builds of `hdl_dump`, `pfsshell` and `pfsfuse` work on that file. Mounted game partitions are opened by Windows through `\\wsl.localhost\<distro>\...`, so no drive letter is needed.
+
+Prerequisites:
+1. Windows 10 or 11 with WSL2 (`wsl --install` in an administrator terminal, then restart)
+2. An Ubuntu or Debian distro running as WSL **2** (automatic setup supports Ubuntu and Debian)
+3. The OPL NBD server running on the PSX (default port **10809**)
+4. A network connection between the PC and the PSX
+
+**Step-by-step guide with every command: [WSL2-SETUP.md](WSL2-SETUP.md).**
+
+Setup is done inside the application: choose `WSL2 NBD` as connection method, select the distro and click **Install / Repair WSL Backend** (also in the menu as **WSL2 Setup**). It installs `libnbd-bin` (nbdfuse, nbdinfo), `fuse3`, `libfuse-dev`, `python3` and the build tools, builds the pinned `hdl_dump` and `pfsshell`/`pfsfuse` and installs the PSX XMB Manager helper. It asks before running and never runs on its own at startup.
+
+- Dokan is **not** required for the WSL2 network connection.
+- Dokan is still used when a PSX HDD is connected **locally** to the PC (`Local HDD` connection method) and a partition is mounted.
+
+### Troubleshooting
+| Problem | What to do |
+|-----|-----|
+| WSL is not installed | Run `wsl --install` in an administrator terminal, restart Windows, then start PSX XMB Manager again. |
+| The distro is WSL1 | WSL1 distros are greyed out. Convert it with `wsl --set-version <distro> 2` or install a new Ubuntu distro. |
+| The OPL NBD server is not running | Start the NBD server in Open PS2 Loader on the PSX and check the IP address shown there. Connect reports `NBD_SERVER_UNREACHABLE` until it answers. |
+| Firewall or network cannot reach the PSX | The PC and the PSX must be on the same network and TCP port 10809 must not be blocked. WSL2 uses the Windows network, so a VPN or firewall rule on Windows also affects it. |
+| `/dev/fuse` is unavailable | Update WSL (`wsl --update`), then restart it with `wsl --shutdown`. nbdfuse and pfsfuse cannot work without `/dev/fuse`. |
+| Linux tools are missing or the helper is outdated | Click **Install / Repair WSL Backend**. The status rows under the connect button show which tool is missing. |
+| A stale mount remains after a crash | Click **Recover Connection**. It unmounts the old PFS partitions first and then the NBD connection inside WSL. |
+
+Logs of every backend operation and of the setup are written to `%LOCALAPPDATA%\PSX XMB Manager\Logs`.
 
 ## Create & Install Projects
 - [https://github.com/SvenGDK/PSX-XMB-Manager/wiki/Manage-Projects](https://github.com/SvenGDK/PSX-XMB-Manager/wiki/Manage-Projects)
@@ -57,6 +85,7 @@ The installed game or homebrew will show up on the XMB where you can start it li
 |-----|-----|
 | dd | [http://www.chrysocome.net/dd](http://www.chrysocome.net/dd) |
 | hdl_dump | [https://github.com/ps2homebrew/hdl-dump](https://github.com/ps2homebrew/hdl-dump) |
+| nbdfuse & nbdinfo (libnbd, inside WSL2) | [https://gitlab.com/nbdkit/libnbd](https://gitlab.com/nbdkit/libnbd) |
 | kelftool | [https://github.com/xfwcfw/kelftool](https://github.com/xfwcfw/kelftool) |
 | PAKerUtility | [El_isra](https://github.com/israpps/PAKerUtility) |
 | pfsshell & pfsfuse | [https://github.com/ps2homebrew/pfsshell](https://github.com/ps2homebrew/pfsshell) |
